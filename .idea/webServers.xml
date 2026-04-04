@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="3d96cb61-ed3d-4a75-bec9-141b770aeadb" name="fdsm">
+        <fileTransfer rootFolder="/data/tangning/proj_6" accessType="SFTP" host="47.101.185.34" port="22222" sshConfigId="4f8642bf-1931-4548-b436-f3f7950514ed" sshConfig="fdsm" keyPair="true">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" isUseRsync="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>

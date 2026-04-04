@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" serverName="fdsm" remoteFilesAllowedToDisappearOnAutoupload="false">
+    <serverData>
+      <paths name="fdsm">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+          <excludedPaths>
+            <excludedPath path="/amazon_emb" />
+            <excludedPath path="/amazon_emb_test" />
+            <excludedPath path="/amazon_raw" />
+            <excludedPath path="/outputs" />
+            <excludedPath path="/step4.zip" />
+            <excludedPath path="/Qwen3-Embedding-0.6B" />
+          </excludedPaths>
+        </serverdata>
+      </paths>
+    </serverData>
+  </component>
+</project>
