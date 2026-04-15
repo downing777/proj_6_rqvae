@@ -1,0 +1,31 @@
+{
+  "type": "object",
+  "required": [
+    "item_id",
+    "sid",
+    "context",
+    "target_title"
+  ],
+  "properties": {
+    "item_id": {
+      "type": "string"
+    },
+    "sid": {
+      "type": "array",
+      "items": {
+        "type": "integer"
+      },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "context": {
+      "type": "string"
+    },
+    "target_title": {
+      "type": "string"
+    },
+    "meta": {
+      "type": "object"
+    }
+  }
+}

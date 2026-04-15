@@ -1,0 +1,2 @@
+{"item_id": "B0-123", "sid": [1, 2, 3], "context": "品牌: XX; 品类: 蓝牙耳机; 卖点: 长续航, 降噪, 舒适佩戴", "target_title": "长续航降噪蓝牙耳机，通勤运动都舒适", "meta": {"split": "train"}}
+{"item_id": "B0-456", "sid": [8, 6, 4], "context": "品牌: YY; 品类: 咖啡机; 卖点: 一键萃取, 小巧, 易清洗", "target_title": "一键萃取小巧咖啡机，在家轻松喝好咖啡", "meta": {"split": "train"}}

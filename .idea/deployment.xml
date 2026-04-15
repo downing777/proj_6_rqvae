@@ -14,6 +14,8 @@
             <excludedPath path="/outputs" />
             <excludedPath path="/step4.zip" />
             <excludedPath path="/Qwen3-Embedding-0.6B" />
+            <excludedPath path="/wandb" />
+            <excludedPath path="/logs" />
           </excludedPaths>
         </serverdata>
       </paths>

@@ -225,15 +225,13 @@ def _as_seq_batch(x: torch.Tensor, device: str):
 def _sample_users_from_items(
     item_user_indices: List[List[int]],
     user_embeddings: torch.Tensor,
-    users_per_item: int,
     rng: random.Random,
 ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
     sampled_indices_per_item: List[List[int]] = []
     for users in item_user_indices:
         if not users:
             continue
-        k = min(users_per_item, len(users))
-        sampled_indices_per_item.append(rng.sample(users, k))
+        sampled_indices_per_item.append(rng.sample(users, len(users)))
     if not sampled_indices_per_item:
         raise RuntimeError("No users sampled from item batch.")
     flat_indices = [idx for picked in sampled_indices_per_item for idx in picked]
@@ -250,15 +248,13 @@ def _sample_users_from_items(
 def _sample_users_from_items_with_dedup(
     item_user_indices: List[List[int]],
     user_embeddings: torch.Tensor,
-    users_per_item: int,
     rng: random.Random,
 ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
     sampled_indices_per_item: List[List[int]] = []
     for users in item_user_indices:
         if not users:
             continue
-        k = min(users_per_item, len(users))
-        sampled_indices_per_item.append(rng.sample(users, k))
+        sampled_indices_per_item.append(rng.sample(users, len(users)))
     if not sampled_indices_per_item:
         raise RuntimeError("No users sampled from item batch.")
 
@@ -363,7 +359,6 @@ def _train_rqvae(
     user_ds: UserDataset,
     item_ds: ItemDataset,
     sample_by: str,
-    users_per_item: int,
     iterations: int,
     batch_size: int,
     learning_rate: float,
@@ -414,7 +409,29 @@ def _train_rqvae(
         if wandb is None:
             raise ImportError("wandb is not installed. Install it or disable --wandb-logging.")
         wandb.login()
-        wandb.init(project="rq-vae-user-id-training", config={"sample_by": sample_by})
+        wandb.init(
+            project="rq-vae-user",
+            config={
+                "sample_by": sample_by,
+                "train_iterations": iterations,
+                "train_batch_size": batch_size,
+                "learning_rate": learning_rate,
+                "hidden_dims": hidden_dims,
+                "embed_dim": embed_dim,
+                "codebook_size": codebook_size,
+                "n_layers": n_layers,
+                "commitment_weight": commitment_weight,
+                "seed": seed,
+                "enable_item_mi_loss": enable_item_mi_loss,
+                "dedup_users_in_item_batch": dedup_users_in_item_batch,
+                "mi_alpha": mi_alpha,
+                "mi_beta": mi_beta,
+                "mi_weight": mi_weight,
+                "mi_tau": mi_tau,
+                "mi_topk": mi_topk,
+                "mi_reg_layers": mi_reg_layers,
+            },
+        )
 
     use_item_mi_loss = enable_item_mi_loss and sample_by == "item"
     if enable_item_mi_loss and sample_by != "item":
@@ -435,14 +452,12 @@ def _train_rqvae(
                 x, item_groups = _sample_users_from_items_with_dedup(
                     item_user_indices=batch["item_user_indices"],
                     user_embeddings=item_ds.user_embeddings,
-                    users_per_item=users_per_item,
                     rng=rng,
                 )
             else:
                 x, item_groups = _sample_users_from_items(
                     item_user_indices=batch["item_user_indices"],
                     user_embeddings=item_ds.user_embeddings,
-                    users_per_item=users_per_item,
                     rng=rng,
                 )
         x = x.to(device)
@@ -555,12 +570,44 @@ def _save_outputs(output_dir: str, user_ids: List[str], sem_ids: torch.Tensor, m
     print(f"Saved:\n- {csv_path}\n- {jsonl_path}\n- {ckpt_path}")
 
 
+def _resolve_device(device_arg: str) -> str:
+    requested = (device_arg or "auto").strip().lower()
+    if requested == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
+    if requested == "cpu":
+        return "cpu"
+
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("Requested device=cuda but CUDA is not available.")
+        return "cuda"
+
+    if requested.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise ValueError(f"Requested device={requested} but CUDA is not available.")
+        try:
+            idx = int(requested.split(":", 1)[1])
+        except ValueError as e:
+            raise ValueError(f"Invalid CUDA device format: {device_arg}") from e
+        if idx < 0 or idx >= torch.cuda.device_count():
+            raise ValueError(
+                f"CUDA device index out of range: {idx}. "
+                f"Available count={torch.cuda.device_count()}."
+            )
+        return f"cuda:{idx}"
+
+    raise ValueError(
+        f"Unsupported --device={device_arg}. Use one of: auto, cpu, cuda, cuda:<index>."
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train user RQ-VAE from prebuilt Amazon dataset cache.")
     parser.add_argument(
         "--built-data-path",
         type=str,
-        default="outputs/amazon_user_item_dataset.npz",
+        default="amazon_emb/amazon_user_item_dataset.user.npz",
         help="Path to dataset base .npz or split .user.npz (for example amazon_user_item_dataset.npz or amazon_user_item_dataset.user.npz).",
     )
     parser.add_argument(
@@ -571,24 +618,29 @@ def main() -> None:
     )
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--sample-by", type=str, choices=["user", "item"], default="user")
-    parser.add_argument("--users-per-item", type=int, default=1)
     parser.add_argument("--train-iterations", type=int, default=5000)
     parser.add_argument("--train-batch-size", type=int, default=256)
-    parser.add_argument("--learning-rate", type=float, default=5e-4)
+    parser.add_argument("--learning-rate", type=float, default=5e-6)
     parser.add_argument("--hidden-dims", type=int, nargs="+", default=[512, 256, 128])
     parser.add_argument("--embed-dim", type=int, default=32)
-    parser.add_argument("--codebook-size", type=int, default=256)
+    parser.add_argument("--codebook-size", type=int, default=32)
     parser.add_argument("--n-layers", type=int, default=3)
-    parser.add_argument("--commitment-weight", type=float, default=0.25)
+    parser.add_argument("--commitment-weight", type=float, default=0.25) # 量化损失与重建损失
     parser.add_argument("--enable-item-mi-loss", action="store_true")
-    parser.add_argument("--mi-alpha", type=float, default=1.0)
+    parser.add_argument("--mi-alpha", type=float, default=1.0) # 互信息损失的权重
     parser.add_argument("--mi-beta", type=float, default=1.0)
-    parser.add_argument("--mi-weight", type=float, default=1.0)
+    parser.add_argument("--mi-weight", type=float, default=1.0) # MI loss 的权重
     parser.add_argument("--mi-tau", type=float, default=0.2)
     parser.add_argument("--mi-topk", type=int, default=32)
     parser.add_argument("--mi-reg-layers", type=int, default=3)
     parser.add_argument("--no-dedup-users-in-item-batch", action="store_false", dest="dedup_users_in_item_batch")
     parser.set_defaults(dedup_users_in_item_batch=True)
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Training device: auto, cpu, cuda, or cuda:<index>.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb-logging", action="store_true")
     args = parser.parse_args()
@@ -600,7 +652,8 @@ def main() -> None:
     torch.manual_seed(args.seed)
     _disable_torch_compile()
     _add_local_rqvae_to_path()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _resolve_device(args.device)
+    print(f"[env] Using device: {device}")
 
     print("[1/3] Loading built dataset...")
     user_ds, item_ds = _load_built_dataset(args.built_data_path, item_user_map_path=args.item_user_map_path)
@@ -611,7 +664,6 @@ def main() -> None:
         user_ds=user_ds,
         item_ds=item_ds,
         sample_by=args.sample_by,
-        users_per_item=args.users_per_item,
         iterations=args.train_iterations,
         batch_size=args.train_batch_size,
         learning_rate=args.learning_rate,

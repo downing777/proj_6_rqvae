@@ -1,0 +1,2 @@
+{"item_id": "B0-123", "sid": [1, 2, 3], "context": "品牌: XX; 品类: 蓝牙耳机; 卖点: 长续航, 降噪, 舒适佩戴", "title_chosen": "长续航降噪蓝牙耳机，通勤运动都舒适", "title_rejected": "耳机新品上市，喜欢就来看看", "negative_type": "easy_random", "meta": {"source": "ctr_pair"}}
+{"item_id": "B0-123", "sid": [1, 2, 3], "context": "品牌: XX; 品类: 蓝牙耳机; 卖点: 长续航, 降噪, 舒适佩戴", "title_chosen": "长续航降噪蓝牙耳机，通勤运动都舒适", "title_rejected": "高颜值入耳式耳机，拍照穿搭更吸睛", "negative_type": "hard_cross_sid", "meta": {"source": "cross_sid_negative"}}
