@@ -5,6 +5,7 @@
       <sshConfig host="47.101.185.34" id="4f8642bf-1931-4548-b436-f3f7950514ed" keyPath="$USER_HOME$/.ssh/id_rsa" port="22222" customName="fdsm" nameFormat="CUSTOM" username="tangning" useOpenSSHConfig="true">
         <option name="customName" value="fdsm" />
       </sshConfig>
+      <sshConfig authType="PASSWORD" host="localhost" id="f899fa3e-1bd5-4e62-a782-c6185fd1b530" port="22" nameFormat="DESCRIPTIVE" useOpenSSHConfig="true" />
     </configs>
   </component>
 </project>

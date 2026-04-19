@@ -1,0 +1,4 @@
+{"item_id": "US-ELEC-001", "sid": [7, 1, 17], "context": "站点: 美国; 品牌: SoundPeak; 品类: 蓝牙耳机; 核心卖点: 主动降噪, 36小时续航, 通话清晰; 人群偏好: 极致性价比, 预算友好", "target_title": "SoundPeak蓝牙耳机，主动降噪，预算友好更突出，花更少的钱拿下核心功能", "meta": {"split": "train", "mock": true}}
+{"item_id": "US-ELEC-001", "sid": [15, 14, 8], "context": "站点: 美国; 品牌: SoundPeak; 品类: 蓝牙耳机; 核心卖点: 主动降噪, 36小时续航, 通话清晰; 人群偏好: 效率优先, 节省时间", "target_title": "SoundPeak蓝牙耳机，主动降噪，节省时间更突出，一步到位，减少重复操作", "meta": {"split": "train", "mock": true}}
+{"item_id": "US-HOME-002", "sid": [1, 5, 13], "context": "站点: 美国; 品牌: BrewCraft; 品类: 滴滤咖啡机; 核心卖点: 一键冲煮, 保温40分钟, 可拆洗滤网; 人群偏好: 品质稳定, 耐用安心", "target_title": "BrewCraft滴滤咖啡机，一键冲煮，耐用安心更突出，长期使用更省心", "meta": {"split": "train", "mock": true}}
+{"item_id": "US-HOME-002", "sid": [5, 27, 2], "context": "站点: 美国; 品牌: BrewCraft; 品类: 滴滤咖啡机; 核心卖点: 一键冲煮, 保温40分钟, 可拆洗滤网; 人群偏好: 功能党, 参数够硬", "target_title": "BrewCraft滴滤咖啡机，一键冲煮，参数够硬更突出，关键功能覆盖更完整", "meta": {"split": "train", "mock": true}}

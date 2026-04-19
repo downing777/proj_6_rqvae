@@ -1,13 +1,22 @@
 import argparse
 import os
+import sys
 from typing import List
 
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
+if __package__ is None or __package__ == "":
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
 from softprompt.models import SidModelLoadConfig, build_sid_model
-from softprompt.train.common import SFTJsonlDataset, build_prompt_target_tensors, load_jsonl
+from softprompt.train.common import (
+    SFTJsonlDataset,
+    build_prompt_target_tensors,
+    collated_sid_to_tensor,
+    load_jsonl,
+)
 
 
 def parse_sid_dims(text: str) -> List[int]:
@@ -65,7 +74,7 @@ def main() -> None:
         for batch in loader:
             prompts = batch["prompt"]
             targets = batch["target"]
-            sid = torch.tensor(batch["sid"], dtype=torch.long, device=args.device)
+            sid = collated_sid_to_tensor(batch["sid"], device=args.device)
 
             input_ids, attention_mask, labels = build_prompt_target_tensors(
                 tokenizer=tokenizer,

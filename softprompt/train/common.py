@@ -85,14 +85,15 @@ def build_prompt_target_tensors(
     prompt_packed = tokenizer(
         prompt_only,
         return_tensors="pt",
-        padding=False,
+        padding=True,
         truncation=True,
         max_length=max_length,
     )
     labels = packed["input_ids"].clone()
     labels[packed["attention_mask"] == 0] = -100
-    for i, prompt_ids in enumerate(prompt_packed["input_ids"]):
-        labels[i, : len(prompt_ids)] = -100
+    for i in range(prompt_packed["attention_mask"].size(0)):
+        prompt_len = int(prompt_packed["attention_mask"][i].sum().item())
+        labels[i, :prompt_len] = -100
     return packed["input_ids"], packed["attention_mask"], labels
 
 
@@ -119,3 +120,28 @@ def sequence_logp(model, tokenizer, sid: torch.Tensor, prompts: List[str], targe
         "attention_mask": attention_mask,
         "labels": labels,
     }
+
+
+def collated_sid_to_tensor(sid_batch, device: str) -> torch.Tensor:
+    """
+    Convert DataLoader-collated SID batch into shape [B, L].
+
+    PyTorch default collate turns list-valued `sid` into:
+      [tensor(level0_ids), tensor(level1_ids), tensor(level2_ids)]
+    so we stack by levels and transpose back to batch-major.
+    """
+    if isinstance(sid_batch, torch.Tensor):
+        sid = sid_batch.long()
+    elif isinstance(sid_batch, list):
+        if len(sid_batch) == 0:
+            raise ValueError("Empty sid batch.")
+        if isinstance(sid_batch[0], torch.Tensor):
+            sid = torch.stack([x.long() for x in sid_batch], dim=1)
+        else:
+            sid = torch.tensor(sid_batch, dtype=torch.long)
+    else:
+        sid = torch.tensor(sid_batch, dtype=torch.long)
+
+    if sid.dim() == 1:
+        sid = sid.unsqueeze(0)
+    return sid.to(device)

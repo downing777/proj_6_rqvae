@@ -1,10 +1,14 @@
 import argparse
 import json
 import os
+import sys
 from typing import Dict, List
 
 import torch
 from transformers import AutoTokenizer
+
+if __package__ is None or __package__ == "":
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from softprompt.models import SidModelLoadConfig, build_sid_model
 from softprompt.train.common import render_prompt
