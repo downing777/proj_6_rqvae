@@ -16,6 +16,7 @@ from softprompt.train.common import (
     build_prompt_target_tensors,
     collated_sid_to_tensor,
     load_jsonl,
+    truncate_context_in_rows,
 )
 
 
@@ -24,7 +25,7 @@ def parse_sid_dims(text: str) -> List[int]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="SFT training for SID-conditioned title generation.")
+    parser = argparse.ArgumentParser(description="SFT: SID 软前缀, 基座可冻结。")
     parser.add_argument("--train-jsonl", type=str, required=True)
     parser.add_argument("--base-model", type=str, required=True)
     parser.add_argument("--output-dir", type=str, default="softprompt/outputs/sft")
@@ -33,15 +34,25 @@ def main() -> None:
     parser.add_argument("--num-virtual-tokens", type=int, default=16)
     parser.add_argument("--num-basis-tokens", type=int, default=64)
     parser.add_argument("--train-batch-size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--max-length", type=int, default=256)
+    parser.add_argument("--learning-rate", type=float, default=3e-5)
+    parser.add_argument("--max-length", type=int, default=30000)
+    parser.add_argument("--max-context-chars", type=int, default=0)
+    parser.add_argument("--max-steps", type=int, required=True, help="优化器步数, 到即停(数据可多轮扫)。")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--freeze-backbone", action="store_true")
+    parser.add_argument(
+        "--no-freeze-backbone",
+        action="store_true",
+        help="不冻结基座(显存/算力大); 默认只训软前缀。",
+    )
     args = parser.parse_args()
+    freeze = not args.no_freeze_backbone
+
+    device = torch.device(args.device)
 
     os.makedirs(args.output_dir, exist_ok=True)
-    rows = load_jsonl(args.train_jsonl)
+    rows = truncate_context_in_rows(
+        load_jsonl(args.train_jsonl), max_context_chars=args.max_context_chars
+    )
     dataset = SFTJsonlDataset(rows)
     loader = DataLoader(dataset, batch_size=args.train_batch_size, shuffle=True)
 
@@ -57,24 +68,28 @@ def main() -> None:
             num_virtual_tokens=args.num_virtual_tokens,
             num_basis_tokens=args.num_basis_tokens,
         ),
-        device=args.device,
+        device=str(device),
     )
-    if args.freeze_backbone:
+    if freeze:
         model.freeze_backbone()
+        print("Backbone frozen: SidPrefix only.")
+    else:
+        print("Backbone not frozen: full finetune + SidPrefix.")
 
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.learning_rate,
-        weight_decay=0.01,
-    )
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=args.learning_rate, weight_decay=0.01)
 
     model.train()
     global_step = 0
-    for epoch in range(args.epochs):
+    _grad_clip = 1.0
+
+    while global_step < args.max_steps:
         for batch in loader:
+            if global_step >= args.max_steps:
+                break
             prompts = batch["prompt"]
             targets = batch["target"]
-            sid = collated_sid_to_tensor(batch["sid"], device=args.device)
+            sid = collated_sid_to_tensor(batch["sid"], device=str(device))
 
             input_ids, attention_mask, labels = build_prompt_target_tensors(
                 tokenizer=tokenizer,
@@ -82,9 +97,9 @@ def main() -> None:
                 targets=targets,
                 max_length=args.max_length,
             )
-            input_ids = input_ids.to(args.device)
-            attention_mask = attention_mask.to(args.device)
-            labels = labels.to(args.device)
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            labels = labels.to(device)
 
             out = model(
                 input_ids=input_ids,
@@ -93,19 +108,25 @@ def main() -> None:
                 labels=labels,
             )
             loss = out.loss
+            if not torch.isfinite(loss):
+                print("[sft] skip non-finite loss (调 max-length / max-context-chars).")
+                continue
+
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if _grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(params, _grad_clip)
             optimizer.step()
-
             global_step += 1
-            if global_step % 20 == 0:
-                print(f"[sft] epoch={epoch+1} step={global_step} loss={loss.item():.4f}")
+            if global_step % 20 == 0 or global_step >= args.max_steps:
+                print(f"[sft] step={global_step}/{args.max_steps} loss={loss.item():.4f}")
+            if global_step >= args.max_steps:
+                break
 
     ckpt_path = os.path.join(args.output_dir, "sid_sft.pt")
     torch.save({"sid_prefix": model.sid_prefix.state_dict()}, ckpt_path)
     tokenizer.save_pretrained(args.output_dir)
-    print(f"Saved SFT SID adapter to: {ckpt_path}")
-    print(f"Trainable params: {model.trainable_parameters_report()}")
+    print(f"Saved: {ckpt_path}  {model.trainable_parameters_report()}")
 
 
 if __name__ == "__main__":

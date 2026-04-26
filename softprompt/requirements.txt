@@ -1,8 +1,59 @@
-torch==2.5.1
-transformers>=4.51.0
-accelerate>=0.33.0
+# =============================================================================
+# softprompt: SFT / DPO 训练、OpenAI 式推理、dpo_title_gen
+# Python 建议: 3.10 / 3.11
+#
+# --- 有 NVIDIA GPU: 分两步 (本文件不列出 torch，避免 pip 装错 CUDA/CPU 变体) ---
+#
+# (A) 系统 CUDA 12.0，但用 **CUDA 11.8 预编译** 的 PyTorch 轮子 (常见)：
+#     # transformers 5.5+ 要求 torch>=2.4；且须 numpy<2（见下），勿装 torch 2.1 老轮子。
+#     pip install -U pip
+#     pip install "numpy<2" torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+#     pip install -r requirements.txt
+#     说明: cu118 的 PyTorch 自带运行库；以官网版本为准: https://pytorch.org/get-started/locally/
+# (B) 若用 **官方 cu121 / cu124** 等，不要用 cu118 命令；请打开 pytorch.org 选自己的 CUDA 后复制命令
+#     再 pip install -r requirements.txt
+#
+# --- 仅 CPU ---
+#     pip install "numpy<2" torch torchvision torchaudio
+#     pip install -r requirements.txt
+#
+# 新建环境示例:
+#   conda create -n softprompt python=3.11 -y
+#   conda activate softprompt
+#   然后按上面 (A) 或 CPU 先装 torch，再装本文件。
+#
+# =============================================================================
+
+# ---- HuggingFace 栈（与 transformers 5.5.x 同生态；勿随意降级 huggingface-hub<1.5，易 ImportError）----
+huggingface-hub>=1.5.0,<2.0
+tokenizers>=0.22.0,<=0.23.0
+transformers>=4.51.0,<6.0.0
 safetensors>=0.4.0
 sentencepiece>=0.2.0
-datasets>=2.20.0
+regex>=2023.0.0
+accelerate>=0.33.0
+# regex: transformers 内部会 import; 未装会报 No module named 'regex'
+
+# ---- 数值 / 张量（训练必需）----
+# 固定 numpy 1.x：numpy 2 与 torch 2.1、部分扩展不兼容；transformers 5.5+ 需 torch>=2.4，勿用 2.1 老包
+numpy>=1.24.0,<2.0.0
+# torch: 先按文件头装 torch>=2.4 (cu118)，再 pip install -r
+
+# ---- 工程 / 小工具（HF / 训练常用传递依赖，显式写出便于锁环境）----
+packaging>=23.0
+filelock>=3.12.0
+pyyaml>=6.0
 tqdm>=4.66.0
-numpy>=1.24.0
+requests>=2.31.0
+typing_extensions>=4.8.0
+
+# ---- 生成 DPO 数据: dpo_title_gen.py（vLLM OpenAI 兼容 API）----
+openai>=1.30.0
+httpx>=0.27.0
+
+# ---- 可选: 如将来用 HF datasets / 复现 data 工具 ----
+# datasets>=2.20.0
+
+# ---- 以下一般不必手写（会随上列自动装），需要离线锁版本时可取消注释并 pin ----
+# protobuf>=4.0.0
+# fsspec>=2023.0.0

@@ -20,6 +20,26 @@ def load_jsonl(path: str) -> List[Dict[str, object]]:
     return rows
 
 
+def truncate_context_in_rows(
+    rows: List[Dict[str, object]], max_context_chars: int
+) -> List[Dict[str, object]]:
+    """
+    过长 context 在 token 化时易占满 max_length, 被截断后没有「目标标题」可监督, loss=nan.
+    仅截断 `context` 字符串: 保尾部(评论/要点往往在末段), 见训练脚本 --max-context-chars。
+    """
+    if max_context_chars <= 0:
+        return rows
+    out: List[Dict[str, object]] = []
+    for r in rows:
+        c = r.get("context", "")
+        if not isinstance(c, str) or len(c) <= max_context_chars:
+            out.append(r)
+            continue
+        rc = {**r, "context": c[-max_context_chars:]}
+        out.append(rc)
+    return out
+
+
 def render_prompt(context: str) -> str:
     return PROMPT_TEMPLATE.format(context=context)
 

@@ -18,6 +18,7 @@ from softprompt.train.common import (
     collated_sid_to_tensor,
     load_jsonl,
     sequence_logp,
+    truncate_context_in_rows,
 )
 
 
@@ -39,7 +40,7 @@ def dpo_loss(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="DPO training for SID-conditioned title generation.")
+    parser = argparse.ArgumentParser(description="DPO: 只更新 SID 软前缀(默认冻结基座)。")
     parser.add_argument("--train-jsonl", type=str, required=True)
     parser.add_argument("--base-model", type=str, required=True)
     parser.add_argument("--sft-ckpt", type=str, required=True)
@@ -49,17 +50,25 @@ def main() -> None:
     parser.add_argument("--num-virtual-tokens", type=int, default=16)
     parser.add_argument("--num-basis-tokens", type=int, default=64)
     parser.add_argument("--train-batch-size", type=int, default=2)
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--learning-rate", type=float, default=5e-5)
-    parser.add_argument("--max-length", type=int, default=256)
-    parser.add_argument("--beta", type=float, default=0.1)
-    parser.add_argument("--kl-to-nosid-weight", type=float, default=0.0)
+    parser.add_argument("--learning-rate", type=float, default=3e-5)
+    parser.add_argument("--max-length", type=int, default=30000)
+    parser.add_argument("--max-context-chars", type=int, default=0)
+    parser.add_argument("--max-steps", type=int, required=True, help="优化器步数, 到即停(数据可多轮扫)。")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--freeze-backbone", action="store_true")
+    parser.add_argument(
+        "--no-freeze-backbone",
+        action="store_true",
+        help="不冻结基座(显存大); 默认只训软前缀。",
+    )
     args = parser.parse_args()
+    freeze = not args.no_freeze_backbone
+
+    device = torch.device(args.device)
 
     os.makedirs(args.output_dir, exist_ok=True)
-    rows = load_jsonl(args.train_jsonl)
+    rows = truncate_context_in_rows(
+        load_jsonl(args.train_jsonl), max_context_chars=args.max_context_chars
+    )
     dataset = DPOJsonlDataset(rows)
     loader = DataLoader(dataset, batch_size=args.train_batch_size, shuffle=True)
 
@@ -74,34 +83,37 @@ def main() -> None:
         num_virtual_tokens=args.num_virtual_tokens,
         num_basis_tokens=args.num_basis_tokens,
     )
-    model = build_sid_model(cfg, device=args.device)
-    sft_state = torch.load(args.sft_ckpt, map_location=args.device)
+    model = build_sid_model(cfg, device=str(device))
+    sft_state = torch.load(args.sft_ckpt, map_location="cpu")
     model.sid_prefix.load_state_dict(sft_state["sid_prefix"], strict=True)
-    if args.freeze_backbone:
+    if freeze:
         model.freeze_backbone()
+        print("Backbone frozen: DPO on SidPrefix; ref 同步。")
+    else:
+        print("DPO: policy+ref 全参(显存大)。")
     model.train()
 
-    ref_model = build_sid_model(cfg, device=args.device)
+    ref_model = build_sid_model(cfg, device=str(device))
     ref_model.load_state_dict(copy.deepcopy(model.state_dict()), strict=True)
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad = False
 
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.learning_rate,
-        weight_decay=0.01,
-    )
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=args.learning_rate, weight_decay=0.01)
+    _grad_clip = 1.0
 
     global_step = 0
-    for epoch in range(args.epochs):
+    while global_step < args.max_steps:
         for batch in loader:
-            sid = collated_sid_to_tensor(batch["sid"], device=args.device)
+            if global_step >= args.max_steps:
+                break
+            sid = collated_sid_to_tensor(batch["sid"], device=str(device))
             prompts = batch["prompt"]
             chosen = batch["chosen"]
             rejected = batch["rejected"]
 
-            pi_chosen, out_chosen, chosen_pack = sequence_logp(
+            pi_chosen, _, _ = sequence_logp(
                 model=model,
                 tokenizer=tokenizer,
                 sid=sid,
@@ -140,36 +152,29 @@ def main() -> None:
                 pi_rejected=pi_rejected,
                 ref_chosen=ref_chosen,
                 ref_rejected=ref_rejected,
-                beta=args.beta,
+                beta=0.1,
             )
-
-            if args.kl_to_nosid_weight > 0:
-                zero_sid = torch.zeros_like(sid)
-                no_sid_out = model(
-                    input_ids=chosen_pack["input_ids"],
-                    attention_mask=chosen_pack["attention_mask"],
-                    sid=zero_sid,
-                )
-                sid_logits = out_chosen.logits
-                no_sid_logits = no_sid_out.logits.detach()
-                kl = F.kl_div(
-                    sid_logits.log_softmax(-1),
-                    no_sid_logits.softmax(-1),
-                    reduction="batchmean",
-                )
-                loss = loss + args.kl_to_nosid_weight * kl
+            if not torch.isfinite(loss):
+                print("[dpo] skip non-finite loss (调 max-length / max-context-chars).")
+                continue
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if _grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(params, _grad_clip)
             optimizer.step()
             global_step += 1
-            if global_step % 10 == 0:
-                print(f"[dpo] epoch={epoch+1} step={global_step} loss={loss.item():.4f}")
+            if global_step % 10 == 0 or global_step >= args.max_steps:
+                print(f"[dpo] step={global_step}/{args.max_steps} loss={loss.item():.4f}")
+            if global_step >= args.max_steps:
+                break
+        if global_step >= args.max_steps:
+            break
 
     ckpt_path = os.path.join(args.output_dir, "sid_dpo.pt")
     torch.save({"sid_prefix": model.sid_prefix.state_dict()}, ckpt_path)
     tokenizer.save_pretrained(args.output_dir)
-    print(f"Saved DPO SID adapter to: {ckpt_path}")
+    print(f"Saved: {ckpt_path}")
 
 
 if __name__ == "__main__":
