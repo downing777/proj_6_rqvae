@@ -11,7 +11,7 @@ if __package__ is None or __package__ == "":
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from softprompt.models import SidModelLoadConfig, build_sid_model
-from softprompt.train.common import render_prompt
+from softprompt.train.common import render_prompt, strip_thinking_tags
 
 
 def parse_sid_dims(text: str) -> List[int]:
@@ -38,14 +38,27 @@ def main() -> None:
     parser.add_argument("--sid-embed-dim", type=int, default=64)
     parser.add_argument("--num-virtual-tokens", type=int, default=16)
     parser.add_argument("--num-basis-tokens", type=int, default=64)
-    parser.add_argument("--max-new-tokens", type=int, default=24)
+    parser.add_argument("--max-new-tokens", type=int, default=48)
+    parser.add_argument("--max-input-length", type=int, default=2048,
+                        help="Max tokenizer input length (truncate context if exceeds)")
     parser.add_argument("--num-beams", type=int, default=1)
-    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--max-samples", type=int, default=None,
+                        help="Randomly sample N rows for inference (default: all)")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
+    import random
     rows = load_jsonl(args.input_jsonl)
-    os.makedirs(os.path.dirname(args.output_jsonl), exist_ok=True)
+    if args.max_samples is not None and args.max_samples < len(rows):
+        random.seed(args.seed)
+        rows = random.sample(rows, args.max_samples)
+        print(f"Sampled {len(rows)} rows from {args.input_jsonl}")
+    else:
+        print(f"Using all {len(rows)} rows from {args.input_jsonl}")
+
+    os.makedirs(os.path.dirname(args.output_jsonl) or ".", exist_ok=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
     if tokenizer.pad_token is None:
@@ -65,12 +78,24 @@ def main() -> None:
     model.sid_prefix.load_state_dict(state["sid_prefix"], strict=True)
     model.eval()
 
+    # Suppress special tokens that should not appear in generated titles
+    suppress_token_ids = []
+    for token_str in ["<|endoftext|>", "<|im_start|>", "<|im_end|>"]:
+        ids = tokenizer.encode(token_str, add_special_tokens=False)
+        suppress_token_ids.extend(ids)
+    suppress_token_ids = list(set(suppress_token_ids)) if suppress_token_ids else None
+
+    total = len(rows)
+    print(f"Starting inference: {total} samples, max_new_tokens={args.max_new_tokens}, "
+          f"max_input_length={args.max_input_length}, temperature={args.temperature}")
+
     with open(args.output_jsonl, "w", encoding="utf-8") as f:
-        for row in rows:
+        for idx, row in enumerate(rows, 1):
             sid = torch.tensor([row["sid"]], dtype=torch.long, device=args.device)
             prompt = render_prompt(row["context"])
-            inputs = tokenizer([prompt], return_tensors="pt", truncation=True, max_length=256).to(args.device)
-            generated = model.generate(
+            inputs = tokenizer([prompt], return_tensors="pt", truncation=True, max_length=args.max_input_length).to(args.device)
+            input_len = inputs["input_ids"].shape[1]
+            gen_kwargs = dict(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
                 sid=sid,
@@ -78,7 +103,13 @@ def main() -> None:
                 num_beams=args.num_beams,
                 temperature=args.temperature,
             )
-            text = tokenizer.batch_decode(generated, skip_special_tokens=True)[0]
+            if suppress_token_ids:
+                gen_kwargs["suppress_tokens"] = suppress_token_ids
+            generated = model.generate(**gen_kwargs)
+            # Only decode newly generated tokens (exclude the input prompt)
+            new_tokens = generated[:, input_len:]
+            text = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
+            text = strip_thinking_tags(text)
             f.write(
                 json.dumps(
                     {
@@ -91,6 +122,8 @@ def main() -> None:
                 )
                 + "\n"
             )
+            if idx % 10 == 0 or idx == total:
+                print(f"  [{idx}/{total}] item={row['item_id']} => {text[:60]}")
 
     print(f"Saved predictions to: {args.output_jsonl}")
 

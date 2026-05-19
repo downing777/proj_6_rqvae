@@ -1,8 +1,9 @@
 import argparse
 import copy
+import json
 import os
 import sys
-from typing import List
+from typing import Dict, List
 
 import torch
 import torch.nn.functional as F
@@ -102,6 +103,7 @@ def main() -> None:
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(params, lr=args.learning_rate, weight_decay=0.01)
     _grad_clip = 1.0
+    loss_history: List[Dict[str, float]] = []
 
     global_step = 0
     while global_step < args.max_steps:
@@ -164,17 +166,71 @@ def main() -> None:
                 torch.nn.utils.clip_grad_norm_(params, _grad_clip)
             optimizer.step()
             global_step += 1
+            loss_val = loss.item()
+            loss_history.append({"step": global_step, "loss": loss_val})
             if global_step % 10 == 0 or global_step >= args.max_steps:
-                print(f"[dpo] step={global_step}/{args.max_steps} loss={loss.item():.4f}")
+                print(f"[dpo] step={global_step}/{args.max_steps} loss={loss_val:.4f}")
             if global_step >= args.max_steps:
                 break
         if global_step >= args.max_steps:
             break
 
+    # Save loss history and plot
+    loss_json_path = os.path.join(args.output_dir, "dpo_loss_history.json")
+    with open(loss_json_path, "w", encoding="utf-8") as f:
+        json.dump(loss_history, f)
+    print(f"Loss history saved to: {loss_json_path}")
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        steps = [h["step"] for h in loss_history]
+        losses = [h["loss"] for h in loss_history]
+        plt.figure(figsize=(10, 5))
+        plt.plot(steps, losses, linewidth=0.8, alpha=0.6, label="loss")
+        # Smoothed curve (moving average)
+        window = max(1, len(losses) // 50)
+        if window > 1 and len(losses) > window:
+            smoothed = [sum(losses[max(0, i - window):i + 1]) / min(i + 1, window + 1) for i in range(len(losses))]
+            plt.plot(steps, smoothed, linewidth=2, color="red", label=f"smoothed (window={window})")
+        plt.xlabel("Step")
+        plt.ylabel("Loss")
+        plt.title("DPO Training Loss")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        fig_path = os.path.join(args.output_dir, "dpo_loss_curve.png")
+        plt.savefig(fig_path, dpi=150)
+        plt.close()
+        print(f"Loss curve saved to: {fig_path}")
+    except ImportError:
+        print("matplotlib not installed; skipping loss curve plot.")
+
     ckpt_path = os.path.join(args.output_dir, "sid_dpo.pt")
-    torch.save({"sid_prefix": model.sid_prefix.state_dict()}, ckpt_path)
-    tokenizer.save_pretrained(args.output_dir)
-    print(f"Saved: {ckpt_path}")
+    if freeze:
+        # Only save SID prefix weights
+        torch.save({"sid_prefix": model.sid_prefix.state_dict()}, ckpt_path)
+        tokenizer.save_pretrained(args.output_dir)
+        print(f"Saved (prefix only): {ckpt_path}")
+    else:
+        # Full finetune: save both backbone and SID prefix
+        full_ckpt_dir = os.path.join(args.output_dir, "full_model")
+        os.makedirs(full_ckpt_dir, exist_ok=True)
+        torch.save(
+            {
+                "sid_prefix": model.sid_prefix.state_dict(),
+                "full_model": model.state_dict(),
+            },
+            ckpt_path,
+        )
+        # Also save the backbone in HuggingFace format for easy loading/serving
+        model.backbone.save_pretrained(full_ckpt_dir)
+        tokenizer.save_pretrained(full_ckpt_dir)
+        tokenizer.save_pretrained(args.output_dir)
+        print(f"Saved (full model): {ckpt_path}")
+        print(f"Saved HF format backbone: {full_ckpt_dir}")
 
 
 if __name__ == "__main__":

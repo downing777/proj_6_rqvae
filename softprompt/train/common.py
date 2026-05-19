@@ -6,7 +6,21 @@ import torch
 from torch.utils.data import Dataset
 
 
-PROMPT_TEMPLATE = "你是电商标题生成助手。\n商品信息：{context}\n请为该 SID 用户群生成一个吸引点击的商品标题："
+import re as _re
+
+PROMPT_TEMPLATE = (
+    "You are a product title generator.\n"
+    "Product info: {context}\n"
+    "Generate a short, compelling English product title for the target SID user group:"
+)
+
+
+def strip_thinking_tags(text: str) -> str:
+    """Remove  blocks and other assistant/role markers from generated text."""
+    text = _re.sub(r"<think>[\s\S]*?</think>", "", text)
+    text = _re.sub(r"<think>[\s\S]*$", "", text)  # unclosed <think>
+    text = _re.sub(r"^assistant\s*", "", text, flags=_re.IGNORECASE)
+    return text.strip()
 
 
 def load_jsonl(path: str) -> List[Dict[str, object]]:
@@ -67,7 +81,6 @@ class SFTJsonlDataset(Dataset):
             "target": row["target_title"],
         }
 
-
 class DPOJsonlDataset(Dataset):
     def __init__(self, rows: List[Dict[str, object]]):
         self.rows = rows
@@ -84,7 +97,6 @@ class DPOJsonlDataset(Dataset):
             "rejected": row["title_rejected"],
         }
 
-
 def build_prompt_target_tensors(
     tokenizer,
     prompts: List[str],
@@ -92,8 +104,8 @@ def build_prompt_target_tensors(
     max_length: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     eos = tokenizer.eos_token or ""
-    texts = [f"{p}\n标题：{t}{eos}" for p, t in zip(prompts, targets)]
-    prompt_only = [f"{p}\n标题：" for p in prompts]
+    texts = [f"{p}\nTitle: {t}{eos}" for p, t in zip(prompts, targets)]
+    prompt_only = [f"{p}\nTitle: " for p in prompts]
 
     packed = tokenizer(
         texts,

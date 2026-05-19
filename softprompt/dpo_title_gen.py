@@ -57,8 +57,8 @@ except ImportError as e:  # pragma: no cover
 
 
 # 直接写在脚本中的默认 API 端点（无需 export OPENAI_*）
-DEFAULT_OPENAI_BASE_URL = "http://localhost:8000/v1"
-DEFAULT_OPENAI_API_KEY = "EMPTY"
+DEFAULT_OPENAI_BASE_URL = "https://idealab.alibaba-inc.com/api/openai/v1/"
+DEFAULT_OPENAI_API_KEY = "7015f1753e78f3067053c6432a933cb7"
 
 SidTuple = Tuple[int, int, int]
 
@@ -215,36 +215,57 @@ def _features_bullets(item: Dict[str, Any], max_bullets: int = 3) -> str:
     return " | ".join(out)
 
 
-def build_product_context(
+def build_training_context(
     item: Dict[str, Any],
-    review_evidence: str,
     sid: SidTuple,
-    other_evidence: Optional[Tuple[SidTuple, str]] = None,
 ) -> str:
+    """Build context for training (no review evidence). This is what the model sees during SFT/DPO."""
     main_cat = item.get("main_category") or ""
     store = item.get("store") or ""
     otitle = (item.get("title") or "")[:300]
     price = item.get("price")
-    price_s = f"{price}" if price is not None else "未知"
+    price_s = f"{price}" if price is not None else "N/A"
     cats = item.get("categories")
     if isinstance(cats, list) and cats:
         cat_s = " > ".join(str(c) for c in cats[:4])
     else:
         cat_s = str(main_cat)
     parts = [
-        f"站点: 美国站; 主类: {main_cat}",
-        f"父 ASIN: {item.get('parent_asin', '')}; 品牌/店铺: {store}",
-        f"原商品标题(英文): {otitle}",
-        f"价格: {price_s}; 浏览类目: {cat_s}",
-        f"商品要点(英文摘录): {_features_bullets(item)}",
-        f"目标 SID (rqid_0, rqid_1, rqid_2): {list(sid)}",
-        f"该 SID 用户群在本商品上的评论证据(可有多条, 已截断): {review_evidence}",
+        f"Site: US; Main category: {main_cat}",
+        f"Parent ASIN: {item.get('parent_asin', '')}; Brand/Store: {store}",
+        f"Original title: {otitle}",
+        f"Price: {price_s}; Browse category: {cat_s}",
+        f"Bullet points: {_features_bullets(item)}",
+        f"Target SID (rqid_0, rqid_1, rqid_2): {list(sid)}",
     ]
-    if other_evidence is not None:
-        osid, otxt = other_evidence
-        parts.append(
-            f"同商品另一 SID 人群 {list(osid)} 的评论证据(用于构造 hard 负样): {otxt}"
-        )
+    return "\n".join(parts)
+
+
+def build_llm_prompt_context(
+    item: Dict[str, Any],
+    review_evidence: str,
+    sid: SidTuple,
+) -> str:
+    """Build context for LLM prompt (includes review evidence). Used only for title generation."""
+    main_cat = item.get("main_category") or ""
+    store = item.get("store") or ""
+    otitle = (item.get("title") or "")[:300]
+    price = item.get("price")
+    price_s = f"{price}" if price is not None else "N/A"
+    cats = item.get("categories")
+    if isinstance(cats, list) and cats:
+        cat_s = " > ".join(str(c) for c in cats[:4])
+    else:
+        cat_s = str(main_cat)
+    parts = [
+        f"Site: US; Main category: {main_cat}",
+        f"Parent ASIN: {item.get('parent_asin', '')}; Brand/Store: {store}",
+        f"Original title: {otitle}",
+        f"Price: {price_s}; Browse category: {cat_s}",
+        f"Bullet points: {_features_bullets(item)}",
+        f"Target SID (rqid_0, rqid_1, rqid_2): {list(sid)}",
+        f"Review evidence from this SID user group (truncated): {review_evidence}",
+    ]
     return "\n".join(parts)
 
 
@@ -293,37 +314,23 @@ def build_sid_to_users(
 
 @dataclass
 class GenTask:
+    """A single title-generation task: one (item, SID) pair."""
     item_id: str
     item: Dict[str, Any]
     sid: SidTuple
-    context: str
-    has_cross: bool
-    other_sid: Optional[SidTuple]
-
-
-def pick_other_sid(
-    sids: List[SidTuple],
-    current: SidTuple,
-    seed: int,
-    asin: str,
-) -> Optional[SidTuple]:
-    others = [s for s in sids if s != current]
-    if not others:
-        return None
-    h = int(hashlib.md5(f"{asin}:{current}".encode()).hexdigest()[:8], 16)
-    rng = random.Random((h ^ seed) & 0xFFFFFFFF)
-    return rng.choice(others)
-
+    context: str  # LLM prompt context (with review, used for title generation)
+    training_context: str  # Training context (no review, stored in output JSONL)
+    user_ids: List[str]  # All user_ids belonging to this SID on this item
 
 def build_tasks(
     items_by_asin: Dict[str, Dict[str, Any]],
     reviews_by_asin: Dict[str, Any],
     user_to_sid: Dict[str, SidTuple],
     max_review_chars: int,
-    skip_hard_if_single_sid: bool,
     seed: int,
     min_chars_evidence: int,
 ) -> List[GenTask]:
+    """Build one GenTask per (item, SID) pair. Each task records all user_ids under that SID."""
     tasks: List[GenTask] = []
     for asin, item in items_by_asin.items():
         urev = reviews_by_asin.get(asin)
@@ -338,31 +345,16 @@ def build_tasks(
             ev = aggregate_reviews(urev, u_set, max_review_chars)
             if len(ev.strip()) < min_chars_evidence:
                 continue
-            can_hard = len(sids) > 1
-            if skip_hard_if_single_sid and len(sids) == 1:
-                can_hard = False
-            other: Optional[SidTuple] = None
-            otxt = ""
-            if can_hard:
-                other = pick_other_sid(sids, sid, seed, asin)
-                if other is not None and other in sid_to_users:
-                    ou = sid_to_users[other]
-                    otxt = aggregate_reviews(urev, ou, min(max_review_chars, 1500))
-            has_cross = bool(can_hard and other is not None and otxt)
-            ctx = build_product_context(
-                item,
-                ev,
-                sid,
-                (other, otxt) if has_cross else None,
-            )
+            llm_ctx = build_llm_prompt_context(item, ev, sid)
+            train_ctx = build_training_context(item, sid)
             tasks.append(
                 GenTask(
                     item_id=asin,
                     item=item,
                     sid=sid,
-                    context=ctx,
-                    has_cross=has_cross,
-                    other_sid=other if has_cross else None,
+                    context=llm_ctx,
+                    training_context=train_ctx,
+                    user_ids=sorted(u_set),
                 )
             )
     return tasks
@@ -382,21 +374,19 @@ def parse_json_object(text: str) -> Dict[str, Any]:
 
 
 SYSTEM_PROMPT = (
-    "你是美国亚马逊电商的标题与营销文案设计助手。根据给定的「商品信息」和「人群 SID」及评论证据，"
-    "为「目标 SID」用户群写更有吸引力的中文商品短标题(用于主图旁或推荐位)。\n"
-    "要求：\n"
-    "1) 标题为中文，长度约 20~50 个汉字(可适当含英文品牌名/型号，勿编造不存在的功能)。\n"
-    "2) title_chosen 必须体现目标 SID 人群在评论里关心的点。\n"
-    "3) title_rejected_easy: 与商品弱相关、套路化、吸引力差的标题(如泛泛的「新品热销」式)。\n"
-    "4) title_rejected_hard: 若上下文中给了「另一 SID」的评论，则写更像是在讨好那一类人群、而非目标 SID 的标题; "
-    "若 JSON 中要求填 null(无 hard 时)，则输出 null。\n"
-    "只输出一个 JSON 对象，键: title_chosen, title_rejected_easy, title_rejected_hard (可为 null)。不要其它文字。"
+    "You are an Amazon product title optimization assistant. Given product information, "
+    "a target user segment (SID), and review evidence from that segment, generate a short, "
+    "compelling English product title tailored to the target SID group's preferences.\n"
+    "Requirements:\n"
+    "1) The title must be in English, around 10-20 words.\n"
+    "2) The title must highlight what the target SID user group cares about based on their reviews.\n"
+    "3) Do NOT invent features that don't exist in the product.\n"
+    "Output ONLY a JSON object with key: title. No other text."
 )
 
 USER_WRAPPER = (
     "【商品与人群信息】\n{context}\n\n"
-    "请只输出 JSON: "
-    "{{\"title_chosen\": \"...\", \"title_rejected_easy\": \"...\", \"title_rejected_hard\": {hard_literal} }}"
+    "请只输出 JSON: {{\"title\": \"...\"}}"
 )
 
 
@@ -422,8 +412,7 @@ async def call_model_once(
     request_timeout: float,
     extra_body: Optional[Dict[str, Any]],
 ) -> Tuple[Dict[str, Any], Optional[Dict[str, int]]]:
-    hard_literal = "null" if not task.has_cross else '"..."'
-    user_msg = USER_WRAPPER.format(context=task.context, hard_literal=hard_literal)
+    user_msg = USER_WRAPPER.format(context=task.context)
     kwargs: Dict[str, Any] = {
         "model": model,
         "messages": [
@@ -484,15 +473,18 @@ def default_usage_jsonl_path(output_jsonl: str) -> str:
         return output_jsonl[: -len(".jsonl")] + ".usage.jsonl"
     return output_jsonl + ".usage.jsonl"
 
+def gen_task_key(item_id: str, sid: SidTuple) -> str:
+    """Key for deduplicating generation tasks (phase 1)."""
+    return f"{item_id}::{sid[0]},{sid[1]},{sid[2]}"
 
-def task_key(item_id: str, sid: SidTuple, neg_type: str) -> str:
-    return f"{item_id}::{sid[0]},{sid[1]},{sid[2]}::{neg_type}"
 
-
-def load_existing_keys(path: str) -> Set[str]:
+def load_existing_titles(path: str) -> Dict[str, str]:
+    """Load already-generated titles from the titles cache file.
+    Returns: {gen_task_key -> title}
+    """
     if not os.path.isfile(path):
-        return set()
-    out: Set[str] = set()
+        return {}
+    out: Dict[str, str] = {}
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -504,55 +496,69 @@ def load_existing_keys(path: str) -> Set[str]:
                 continue
             iid = row.get("item_id")
             sid = row.get("sid")
-            neg = row.get("negative_type")
-            if not iid or not isinstance(sid, list) or len(sid) != 3 or not neg:
+            title = row.get("title", "")
+            if not iid or not isinstance(sid, list) or len(sid) != 3 or not title:
                 continue
-            out.add(task_key(str(iid), (int(sid[0]), int(sid[1]), int(sid[2])), str(neg)))
+            key = gen_task_key(str(iid), (int(sid[0]), int(sid[1]), int(sid[2])))
+            out[key] = title
     return out
 
 
-def dpo_rows_from_parsed(
-    item_id: str,
-    sid: SidTuple,
-    context: str,
-    has_cross: bool,
-    other_sid: Optional[SidTuple],
-    data: Dict[str, Any],
+def build_dpo_pairs(
+    titles_by_item: Dict[str, Dict[SidTuple, str]],
+    task_user_map: Dict[str, List[str]],
+    training_context_map: Dict[str, str],
+    num_hard_negatives: int,
+    seed: int,
 ) -> List[Dict[str, Any]]:
-    chosen = (data.get("title_chosen") or "").strip()
-    rej_e = (data.get("title_rejected_easy") or "").strip()
-    rh = data.get("title_rejected_hard")
-    rej_h = (rh or "").strip() if isinstance(rh, str) else ""
-    if not chosen or not rej_e:
-        raise ValueError("Missing title_chosen or title_rejected_easy")
-    rows: List[Dict[str, Any]] = [
-        {
-            "item_id": item_id,
-            "sid": list(sid),
-            "context": context,
-            "title_chosen": chosen,
-            "title_rejected": rej_e,
-            "negative_type": "easy_random",
-            "meta": {"source": "dpo_title_gen"},
-        }
-    ]
-    if has_cross and rej_h:
-        rows.append(
-            {
-                "item_id": item_id,
-                "sid": list(sid),
-                "context": context,
-                "title_chosen": chosen,
-                "title_rejected": rej_h,
-                "negative_type": "hard_cross_sid",
-                "meta": {
-                    "source": "dpo_title_gen",
-                    "cross_against": list(other_sid) if other_sid else None,
-                },
-            }
-        )
-    return rows
+    """Phase 2: Cross-combine titles within each item to build DPO pairs.
 
+    For each (item, SID), the chosen title is the one generated for that SID.
+    The rejected titles are randomly sampled from other SIDs under the same item.
+    Each pair is expanded to (user, item) granularity.
+    """
+    rng = random.Random(seed)
+    dpo_rows: List[Dict[str, Any]] = []
+
+    for item_id, sid_titles in titles_by_item.items():
+        sids = sorted(sid_titles.keys())
+        if len(sids) < 2:
+            continue  # Need at least 2 SIDs to build DPO pairs
+
+        for sid in sids:
+            chosen_title = sid_titles[sid]
+            other_sids = [s for s in sids if s != sid]
+
+            # Sample up to num_hard_negatives from other SIDs
+            num_to_pick = min(num_hard_negatives, len(other_sids))
+            selected_others = rng.sample(other_sids, num_to_pick)
+
+            # Get user_ids for this (item, sid) pair
+            key = gen_task_key(item_id, sid)
+            user_ids = task_user_map.get(key, [])
+            train_ctx = training_context_map.get(key, "")
+
+            for other_sid in selected_others:
+                rejected_title = sid_titles[other_sid]
+                # Expand to each user under this SID
+                for uid in user_ids:
+                    dpo_rows.append(
+                        {
+                            "user_id": uid,
+                            "item_id": item_id,
+                            "sid": list(sid),
+                            "context": train_ctx,
+                            "title_chosen": chosen_title,
+                            "title_rejected": rejected_title,
+                            "negative_type": "hard_cross_sid",
+                            "meta": {
+                                "source": "dpo_title_gen_cross",
+                                "cross_against": list(other_sid),
+                            },
+                        }
+                    )
+
+    return dpo_rows
 
 async def amain() -> int:
     default_user_sid = (
@@ -590,7 +596,13 @@ async def amain() -> int:
         "--openai-base-url",
         type=str,
         default=DEFAULT_OPENAI_BASE_URL,
-        help=f"Default in script: {DEFAULT_OPENAI_BASE_URL}",
+        help=f"Single endpoint. Default: {DEFAULT_OPENAI_BASE_URL}",
+    )
+    ap.add_argument(
+        "--openai-base-urls",
+        type=str,
+        default="",
+        help="Comma-separated list of base URLs for load balancing (overrides --openai-base-url).",
     )
     ap.add_argument(
         "--openai-api-key",
@@ -614,10 +626,13 @@ async def amain() -> int:
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--max-review-chars", type=int, default=3000)
     ap.add_argument("--min-review-chars", type=int, default=8)
-    ap.add_argument(
-        "--skip-hard-if-single-sid", action=argparse.BooleanOptionalAction, default=True
-    )
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--num-hard-negatives",
+        type=int,
+        default=3,
+        help="每个chosen样本生成的hard负样本数量（来自不同SID群体）",
+    )
     ap.add_argument(
         "--skip-existing", action=argparse.BooleanOptionalAction, default=True
     )
@@ -666,32 +681,51 @@ async def amain() -> int:
     if args.extra_body_json.strip():
         extra_body: Optional[Dict[str, Any]] = json.loads(args.extra_body_json)
     else:
-        extra_body = {"top_k": 20}
+        extra_body = {
+            "top_k": 20,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
 
-    client = AsyncOpenAI(
-        api_key=args.openai_api_key,
-        base_url=args.openai_base_url,
-    )
-    print(f"OpenAI base_url: {args.openai_base_url}")
+    # ---- Multi-endpoint load balancing ----
+    base_urls: List[str] = []
+    if args.openai_base_urls.strip():
+        base_urls = [u.strip() for u in args.openai_base_urls.split(",") if u.strip()]
+    if not base_urls:
+        base_urls = [args.openai_base_url]
+
+    clients: List[AsyncOpenAI] = []
+    for url in base_urls:
+        clients.append(AsyncOpenAI(api_key=args.openai_api_key, base_url=url))
+    print(f"Initialized {len(clients)} API endpoint(s): {base_urls}")
+
+    _client_counter = [0]
+    _client_lock = asyncio.Lock()
+
+    async def get_next_client() -> AsyncOpenAI:
+        async with _client_lock:
+            idx = _client_counter[0] % len(clients)
+            _client_counter[0] += 1
+            return clients[idx]
 
     tasks = build_tasks(
         items_by_asin,
         reviews_by_asin,
         user_to_sid,
         args.max_review_chars,
-        args.skip_hard_if_single_sid,
         args.seed,
         args.min_review_chars,
     )
     print(f"Built {len(tasks)} generation tasks (item, SID).")
 
-    existing: Set[str] = set()
-    if args.skip_existing and os.path.isfile(args.output_jsonl):
-        existing = load_existing_keys(args.output_jsonl)
-        print(f"Skip-existing: {len(existing)} keys in {args.output_jsonl}.")
+    # ---- Titles cache: stores generated titles per (item, SID) ----
+    titles_cache_path = args.output_jsonl.replace(".jsonl", ".titles_cache.jsonl")
+    existing_titles: Dict[str, str] = {}
+    if args.skip_existing:
+        existing_titles = load_existing_titles(titles_cache_path)
+        print(f"Skip-existing: {len(existing_titles)} titles already cached in {titles_cache_path}.")
 
     usage_path = (args.usage_jsonl or default_usage_jsonl_path(args.output_jsonl)).strip()
-    print(f"Token 用量将写入: {usage_path} (每行一条 API 的 usage，含 prompt/completion/total)")
+    print(f"Token 用量将写入: {usage_path}")
 
     out_dir = os.path.dirname(os.path.abspath(args.output_jsonl)) or "."
     os.makedirs(out_dir, exist_ok=True)
@@ -699,6 +733,14 @@ async def amain() -> int:
     if u_dir and u_dir != out_dir:
         os.makedirs(u_dir, exist_ok=True)
 
+    # Filter tasks that already have titles
+    pending_tasks = [
+        t for t in tasks
+        if gen_task_key(t.item_id, t.sid) not in existing_titles
+    ]
+    print(f"Phase 1: {len(pending_tasks)} titles to generate ({len(tasks) - len(pending_tasks)} already cached).")
+
+    # ---- Phase 1: Generate one title per (item, SID) ----
     file_lock = asyncio.Lock()
     sem = asyncio.Semaphore(max(1, args.max_concurrency))
     _sl = asyncio.Lock()
@@ -712,19 +754,19 @@ async def amain() -> int:
         "requests_with_usage": 0,
     }
 
-    async def process_one(t: GenTask) -> None:
-        k_e = task_key(t.item_id, t.sid, "easy_random")
-        k_h = task_key(t.item_id, t.sid, "hard_cross_sid")
-        need_e = (not args.skip_existing) or (k_e not in existing)
-        need_h = t.has_cross and ((not args.skip_existing) or (k_h not in existing))
-        if not need_e and not need_h:
+    async def generate_title(t: GenTask) -> None:
+        """Phase 1: Call LLM to generate a single title for this (item, SID)."""
+        key = gen_task_key(t.item_id, t.sid)
+        if key in existing_titles:
             async with _sl:
                 _st["skip"] += 1
             return
+
         async with sem:
             try:
+                selected_client = await get_next_client()
                 data, usage = await run_with_retry(
-                    client=client,
+                    client=selected_client,
                     model=args.model,
                     task=t,
                     max_tokens=args.max_tokens,
@@ -735,53 +777,44 @@ async def amain() -> int:
                     base_delay=args.retry_base_delay,
                     extra_body=extra_body,
                 )
-                rows = dpo_rows_from_parsed(
-                    t.item_id, t.sid, t.context, t.has_cross, t.other_sid, data
-                )
-                to_write: List[Dict[str, Any]] = []
-                for row in rows:
-                    neg = str(row.get("negative_type", ""))
-                    k = task_key(t.item_id, t.sid, neg)
-                    if args.skip_existing and k in existing:
-                        continue
-                    to_write.append(row)
-                if not to_write:
-                    async with _sl:
-                        _st["skip"] += 1
-                    return
+                title = (data.get("title") or "").strip()
+                if not title:
+                    raise ValueError("Empty title in model response")
+
+                # Save to titles cache (append immediately for resume support)
                 async with file_lock:
-                    with open(args.output_jsonl, "a", encoding="utf-8") as f:
-                        for row in to_write:
-                            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                            f.flush()
-                            existing.add(
-                                task_key(
-                                    t.item_id, t.sid, str(row.get("negative_type", ""))
-                                )
-                            )
+                    existing_titles[key] = title
+                    cache_row = {
+                        "item_id": t.item_id,
+                        "sid": list(t.sid),
+                        "title": title,
+                        "context": t.context,
+                    }
+                    with open(titles_cache_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(cache_row, ensure_ascii=False) + "\n")
+                        f.flush()
+
+                    # Write usage
                     rec: Dict[str, Any] = {
                         "ts": time.time(),
                         "item_id": t.item_id,
                         "sid": list(t.sid),
                         "model": args.model,
-                        "dpo_rows_written": len(to_write),
                     }
                     if usage:
                         rec["usage"] = usage
                     else:
                         rec["usage"] = None
-                        rec["usage_note"] = "server_returned_no_usage; check vLLM version / flags"
                     with open(usage_path, "a", encoding="utf-8") as uf:
                         uf.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         uf.flush()
+
                 async with _sl:
                     _st["ok"] += 1
                     if usage:
                         _st["requests_with_usage"] += 1
                         _st["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
-                        _st["completion_tokens"] += int(
-                            usage.get("completion_tokens", 0) or 0
-                        )
+                        _st["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
                         _st["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
             except Exception:
                 print(
@@ -791,40 +824,70 @@ async def amain() -> int:
                 async with _sl:
                     _st["err"] += 1
 
-    async def run_with_progress() -> None:
+    # Run Phase 1 with progress bar
+    if pending_tasks:
         if args.no_progress:
-            await asyncio.gather(*[process_one(t) for t in tasks])
-            return
-        pbar = tqdm(
-            total=len(tasks),
-            desc="DPO 生成",
-            unit="条",
-            file=sys.stdout,
-            mininterval=0.3,
-        )
+            await asyncio.gather(*[generate_title(t) for t in pending_tasks])
+        else:
+            pbar = tqdm(
+                total=len(pending_tasks),
+                desc="Phase 1: 生成标题",
+                unit="条",
+                file=sys.stdout,
+                mininterval=0.3,
+            )
 
-        async def run_one(t: GenTask) -> None:
+            async def run_one_gen(t: GenTask) -> None:
+                try:
+                    await generate_title(t)
+                finally:
+                    pbar.update(1)
+                    pbar.set_postfix(ok=_st["ok"], err=_st["err"], refresh=False)
+
             try:
-                await process_one(t)
+                await asyncio.gather(*[run_one_gen(t) for t in pending_tasks])
             finally:
-                pbar.update(1)
-                pbar.set_postfix(
-                    ok=_st["ok"],
-                    err=_st["err"],
-                    skip=_st["skip"],
-                    refresh=False,
-                )
+                pbar.close()
 
-        try:
-            await asyncio.gather(*[run_one(t) for t in tasks])
-        finally:
-            pbar.close()
+    print(f"Phase 1 complete: {_st['ok']} titles generated, {_st['err']} errors.")
+    print(f"Total titles available: {len(existing_titles)}")
 
-    await run_with_progress()
+    # ---- Phase 2: Cross-combine titles to build DPO pairs ----
+    print("Phase 2: Building DPO pairs by cross-combining titles within each item...")
+
+    # Group titles by item_id
+    titles_by_item: Dict[str, Dict[SidTuple, str]] = defaultdict(dict)
+    for key, title in existing_titles.items():
+        parts = key.split("::")
+        item_id = parts[0]
+        sid_parts = parts[1].split(",")
+        sid = (int(sid_parts[0]), int(sid_parts[1]), int(sid_parts[2]))
+        titles_by_item[item_id][sid] = title
+
+    # Build user_id and training_context maps from tasks
+    task_user_map: Dict[str, List[str]] = {}
+    training_context_map: Dict[str, str] = {}
+    for t in tasks:
+        key = gen_task_key(t.item_id, t.sid)
+        task_user_map[key] = t.user_ids
+        training_context_map[key] = t.training_context
+
+    dpo_rows = build_dpo_pairs(
+        titles_by_item, task_user_map, training_context_map,
+        args.num_hard_negatives, args.seed,
+    )
+
+    # Write DPO pairs to output
+    with open(args.output_jsonl, "w", encoding="utf-8") as f:
+        for row in dpo_rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    print(f"Phase 2 complete: {len(dpo_rows)} DPO pairs written to {args.output_jsonl}")
     print(
         json.dumps(
             {
                 "output_jsonl": args.output_jsonl,
+                "titles_cache": titles_cache_path,
                 "usage_jsonl": usage_path,
                 "token_usage_aggregated": {
                     "requests_with_usage": _st["requests_with_usage"],
@@ -832,9 +895,11 @@ async def amain() -> int:
                     "sum_completion_tokens": _st["completion_tokens"],
                     "sum_total_tokens": _st["total_tokens"],
                 },
+                "total_titles_generated": len(existing_titles),
+                "total_dpo_pairs": len(dpo_rows),
+                "items_with_cross_sids": sum(1 for v in titles_by_item.values() if len(v) >= 2),
                 "successful_api_calls": _st["ok"],
                 "errors": _st["err"],
-                "skipped_tasks": _st["skip"],
             },
             ensure_ascii=False,
             indent=2,

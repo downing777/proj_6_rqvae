@@ -38,3 +38,4 @@ ValueError: Missing title_chosen or title_rejected_easy
   "errors": 2,
   "skipped_tasks": 159
 }
+Error: --user-sid not found: /home/yuanhanyang.yhy/model_hub/amazon_user/sid/user_semantic_ids.jsonl

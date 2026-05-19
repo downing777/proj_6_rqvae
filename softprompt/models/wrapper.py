@@ -75,6 +75,7 @@ class SidConditionedCausalLM(nn.Module):
         max_new_tokens: int = 24,
         num_beams: int = 1,
         temperature: float = 0.8,
+        suppress_tokens: list = None,
     ) -> torch.Tensor:
         if num_beams != 1:
             raise NotImplementedError("Current SID wrapper supports num_beams=1 only.")
@@ -90,6 +91,8 @@ class SidConditionedCausalLM(nn.Module):
                 sid=sid,
             )
             next_logits = out.logits[:, -1, :]
+            if suppress_tokens:
+                next_logits[:, suppress_tokens] = float("-inf")
             if temperature > 0:
                 probs = torch.softmax(next_logits / max(temperature, 1e-5), dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
@@ -108,7 +111,11 @@ class SidConditionedCausalLM(nn.Module):
 
 
 def build_sid_model(load_config: SidModelLoadConfig, device: str) -> SidConditionedCausalLM:
-    base_model = AutoModelForCausalLM.from_pretrained(load_config.base_model_name_or_path)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        load_config.base_model_name_or_path,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+    )
     sid_prefix = SidPrefixEncoder(
         SidPrefixConfig(
             sid_dims=load_config.sid_dims,
