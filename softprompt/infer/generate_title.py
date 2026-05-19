@@ -91,10 +91,13 @@ def main() -> None:
     with open(args.output_jsonl, "w", encoding="utf-8") as f:
         for idx, row in enumerate(rows, 1):
             sid = torch.tensor([row["sid"]], dtype=torch.long, device=args.device)
-            # 注: 必须与训练时拼接保持一致 (common.py:build_prompt_target_tensors),
-            # 训练用的是 f"{p}\nTitle: {t}{eos}", 推理也必须在 prompt 末尾补 "\nTitle: ",
-            # 否则模型不知道标题该从这里开始, 会延续 instruction 风格的废话。
-            prompt = render_prompt(row["context"]) + "\nTitle: "
+            # 注: 必须与训练时 prompt_only 的拼接保持一致 (common.py:build_prompt_target_tensors),
+            # prompt 截止在 ":" (无尾空格)。
+            # 原因: Qwen BPE 把 "Title: BUFFALO" 的空格和 ' BUFFALO' 合并成单 token,
+            # 但 "Title: " (末尾孤独空格) 会被编成独立 token (id=220), 训练里这种位置
+            # 模型一次都没见过 → 推理 OOD, top-1 容易跳到 EOS 上, 标题被一刀切空。
+            # 训练 texts 里的 "Title: " 空格不动 (它会和 target 首词合并被监督)。
+            prompt = render_prompt(row["context"]) + "\nTitle:"
             inputs = tokenizer([prompt], return_tensors="pt", truncation=True, max_length=args.max_input_length).to(args.device)
             input_len = inputs["input_ids"].shape[1]
             gen_kwargs = dict(

@@ -104,8 +104,14 @@ def build_prompt_target_tensors(
     max_length: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     eos = tokenizer.eos_token or ""
-    texts = [f"{p}\nTitle: {t}{eos}" for p, t in zip(prompts, targets)]
-    prompt_only = [f"{p}\nTitle: " for p in prompts]
+    # 关键: prompt_only 末尾不能带空格! 否则 BPE 会把它编成独立 token (id=220),
+    # 而 full text 里 "Title: BUFFALO" 的空格会和 ' BUFFALO' 合并成单 token (id=91646)。
+    # 末尾空格独立时 prompt_len 多 1, mask 会把 title 第一个 token 也吃掉, 模型从未被
+    # 监督过"看到 [Title, :] 应该吐什么", 推理时还会以 '孤独空格 token' 结尾陷入 OOD。
+    # 解决: prompt_only 截止在 ":"。texts 保留 "Title: {t}", target 自带的空格 BPE 会自动
+    # 和首词合并, 这个合并 token 现在能正常被监督。
+    texts       = [f"{p}\nTitle: {t}{eos}" for p, t in zip(prompts, targets)]
+    prompt_only = [f"{p}\nTitle:"           for p in prompts]
 
     packed = tokenizer(
         texts,
