@@ -219,7 +219,11 @@ def build_training_context(
     item: Dict[str, Any],
     sid: SidTuple,
 ) -> str:
-    """Build context for training (no review evidence). This is what the model sees during SFT/DPO."""
+    """Build context for training (no review evidence). This is what the model sees during SFT/DPO.
+
+    SID 不写进文本: 学生模型的 SID 条件信号只走 soft prefix, 避免文本里的
+    `[x,y,z]` 形成 shortcut 让 SidPrefixEncoder 学不到东西。
+    """
     main_cat = item.get("main_category") or ""
     store = item.get("store") or ""
     otitle = (item.get("title") or "")[:300]
@@ -236,7 +240,6 @@ def build_training_context(
         f"Original title: {otitle}",
         f"Price: {price_s}; Browse category: {cat_s}",
         f"Bullet points: {_features_bullets(item)}",
-        f"Target SID (rqid_0, rqid_1, rqid_2): {list(sid)}",
     ]
     return "\n".join(parts)
 
@@ -246,7 +249,11 @@ def build_llm_prompt_context(
     review_evidence: str,
     sid: SidTuple,
 ) -> str:
-    """Build context for LLM prompt (includes review evidence). Used only for title generation."""
+    """Build context for LLM prompt (includes review evidence). Used only for title generation.
+
+    SID 不写进文本: 老师 LLM 也无法解读 `[x,y,z]` 这串数字, 区分用户群的真正信号是
+    `review_evidence` (来自该 SID 群体的真实评论)。
+    """
     main_cat = item.get("main_category") or ""
     store = item.get("store") or ""
     otitle = (item.get("title") or "")[:300]
@@ -263,7 +270,6 @@ def build_llm_prompt_context(
         f"Original title: {otitle}",
         f"Price: {price_s}; Browse category: {cat_s}",
         f"Bullet points: {_features_bullets(item)}",
-        f"Target SID (rqid_0, rqid_1, rqid_2): {list(sid)}",
         f"Review evidence from this SID user group (truncated): {review_evidence}",
     ]
     return "\n".join(parts)

@@ -78,12 +78,11 @@ def main() -> None:
     model.sid_prefix.load_state_dict(state["sid_prefix"], strict=True)
     model.eval()
 
-    # Suppress special tokens that should not appear in generated titles
-    suppress_token_ids = []
-    for token_str in ["<|endoftext|>", "<|im_start|>", "<|im_end|>"]:
-        ids = tokenizer.encode(token_str, add_special_tokens=False)
-        suppress_token_ids.extend(ids)
-    suppress_token_ids = list(set(suppress_token_ids)) if suppress_token_ids else None
+    # 注: 不再做 suppress_tokens —
+    #   1) EOS 大概率被 suppress 列表撞到 (Qwen 系 <|endoftext|> 就是 EOS),
+    #      撞到后模型永远停不下来, 只能写满 max_new_tokens;
+    #   2) 解码端的 skip_special_tokens=True 已经能把 special token 从字符串里剔除,
+    #      不需要在 logits 层再压一道。
 
     total = len(rows)
     print(f"Starting inference: {total} samples, max_new_tokens={args.max_new_tokens}, "
@@ -92,7 +91,10 @@ def main() -> None:
     with open(args.output_jsonl, "w", encoding="utf-8") as f:
         for idx, row in enumerate(rows, 1):
             sid = torch.tensor([row["sid"]], dtype=torch.long, device=args.device)
-            prompt = render_prompt(row["context"])
+            # 注: 必须与训练时拼接保持一致 (common.py:build_prompt_target_tensors),
+            # 训练用的是 f"{p}\nTitle: {t}{eos}", 推理也必须在 prompt 末尾补 "\nTitle: ",
+            # 否则模型不知道标题该从这里开始, 会延续 instruction 风格的废话。
+            prompt = render_prompt(row["context"]) + "\nTitle: "
             inputs = tokenizer([prompt], return_tensors="pt", truncation=True, max_length=args.max_input_length).to(args.device)
             input_len = inputs["input_ids"].shape[1]
             gen_kwargs = dict(
@@ -102,9 +104,11 @@ def main() -> None:
                 max_new_tokens=args.max_new_tokens,
                 num_beams=args.num_beams,
                 temperature=args.temperature,
+                # 关键: 必须用 tokenizer 的 EOS, 跟训练 common.py:106 拼的 `tokenizer.eos_token`
+                # 对齐。Qwen 系 model.config.eos_token_id 常常和 tokenizer.eos_token_id 不一致
+                # (base EOS vs chat EOS), 用错了 break 永远不触发, 模型只能写满 max_new_tokens。
+                eos_token_id=tokenizer.eos_token_id,
             )
-            if suppress_token_ids:
-                gen_kwargs["suppress_tokens"] = suppress_token_ids
             generated = model.generate(**gen_kwargs)
             # Only decode newly generated tokens (exclude the input prompt)
             new_tokens = generated[:, input_len:]

@@ -76,13 +76,33 @@ class SidConditionedCausalLM(nn.Module):
         num_beams: int = 1,
         temperature: float = 0.8,
         suppress_tokens: list = None,
+        eos_token_id=None,
     ) -> torch.Tensor:
         if num_beams != 1:
             raise NotImplementedError("Current SID wrapper supports num_beams=1 only.")
 
         generated = input_ids
         mask = attention_mask
-        eos_token_id = self.base_model.config.eos_token_id
+        # EOS 解析优先级:
+        #   1) 调用方显式传入 (推理脚本必须传 tokenizer.eos_token_id, 跟训练拼的 eos 对齐)
+        #   2) 顶层 config.eos_token_id
+        #   3) config.text_config.eos_token_id (兼容多模态/组合 config, e.g. Qwen3.5-VL)
+        # 注意: model.config.eos_token_id 和 tokenizer.eos_token_id 在 Qwen 系常常不一致
+        #       (base EOS vs chat EOS), 推理必须用 tokenizer 那一个, 否则 break 永远不触发。
+        if eos_token_id is None:
+            cfg = self.base_model.config
+            eos_token_id = getattr(cfg, "eos_token_id", None)
+            if eos_token_id is None:
+                text_cfg = getattr(cfg, "text_config", None)
+                if text_cfg is not None:
+                    eos_token_id = getattr(text_cfg, "eos_token_id", None)
+        # 支持 int 或 list[int] (生成多个候选 EOS 都触发停止)
+        if isinstance(eos_token_id, int):
+            eos_set = {eos_token_id}
+        elif eos_token_id is None:
+            eos_set = set()
+        else:
+            eos_set = {int(x) for x in eos_token_id}
 
         for _ in range(max_new_tokens):
             out = self.forward(
@@ -105,8 +125,14 @@ class SidConditionedCausalLM(nn.Module):
             )
             mask = torch.cat([mask, append_mask], dim=1)
 
-            if eos_token_id is not None and torch.all(next_token.squeeze(-1) == eos_token_id):
-                break
+            if eos_set:
+                nt = next_token.squeeze(-1)
+                # 整个 batch 都命中任一 EOS 才停
+                hit = torch.zeros_like(nt, dtype=torch.bool)
+                for eid in eos_set:
+                    hit |= nt == eid
+                if torch.all(hit):
+                    break
         return generated
 
 
