@@ -141,10 +141,30 @@ def sequence_logp(model, tokenizer, sid: torch.Tensor, prompts: List[str], targe
 
     with torch.set_grad_enabled(model.training):
         out = model(input_ids=input_ids, attention_mask=attention_mask, sid=sid, labels=labels)
-        logits = out.logits[:, :-1, :]
-        target = labels[:, 1:]
-        valid = target.ne(-100)
-        token_logp = torch.gather(logits.log_softmax(-1), dim=-1, index=target.clamp_min(0).unsqueeze(-1)).squeeze(-1)
+
+        # 关键: SidConditionedCausalLM.forward 在 inputs_embeds 前面拼了 prefix_len 个软前缀,
+        # 因此 out.logits 形状是 [B, prefix_len + K, V] 而 labels 仍是 [B, K]。
+        # 必须把 labels 也补 prefix_len 个 -100 再 shift, 否则 gather 会悄悄只用 logits 的前 K-1
+        # 个位置 (大部分落在 prefix 区间), 等价于把每个 target token 错位到 prefix_len 个位置之外
+        # 的 logit 上去查概率, 给 DPO 喂的是噪声梯度。
+        prefix_len = out.logits.size(1) - labels.size(1)
+        if prefix_len > 0:
+            pad = torch.full(
+                (labels.size(0), prefix_len), -100,
+                device=labels.device, dtype=labels.dtype,
+            )
+            full_labels = torch.cat([pad, labels], dim=1)        # [B, prefix_len + K]
+        else:
+            full_labels = labels
+
+        shift_logits = out.logits[:, :-1, :]                     # [B, prefix_len + K - 1, V]
+        shift_labels = full_labels[:, 1:]                        # [B, prefix_len + K - 1]
+        valid = shift_labels.ne(-100)
+        token_logp = torch.gather(
+            shift_logits.log_softmax(-1),
+            dim=-1,
+            index=shift_labels.clamp_min(0).unsqueeze(-1),
+        ).squeeze(-1)
         token_logp = token_logp * valid
         seq_logp = token_logp.sum(dim=-1)
     return seq_logp, out, {
