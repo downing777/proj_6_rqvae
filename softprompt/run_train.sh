@@ -17,6 +17,9 @@ cd "${ROOT}"
 eval "$(conda shell.bash hook)"
 conda activate softprompt
 
+# ---- 版本标识: 用于区分不同实验, 会作为后缀附加到 log/weight 文件名上 ----
+VERSION="${VERSION:-sft_chosen_dpo}"
+
 # ---- Auto-nohup: 如果不是被 nohup 调用的，则自动用 nohup 重启自己 ----
 if [[ -z "${_TRAIN_NOHUP_WRAPPER:-}" ]]; then
   export _TRAIN_NOHUP_WRAPPER=1
@@ -24,8 +27,8 @@ if [[ -z "${_TRAIN_NOHUP_WRAPPER:-}" ]]; then
   _BASE_MODEL_NAME="$(basename "${QWEN_BASE}")"
   _LOG_DIR="/home/yuanhanyang.yhy/project_6_outputs/logs/${_BASE_MODEL_NAME}"
   mkdir -p "${_LOG_DIR}"
-  _FULL_LOG="${_LOG_DIR}/train_full_${_BASE_MODEL_NAME}.log"
-  _PIDFILE="${_LOG_DIR}/train_${_BASE_MODEL_NAME}.pid"
+  _FULL_LOG="${_LOG_DIR}/train_full_${_BASE_MODEL_NAME}_${VERSION}.log"
+  _PIDFILE="${_LOG_DIR}/train_${_BASE_MODEL_NAME}_${VERSION}.pid"
 
   nohup bash "$0" "$@" >> "${_FULL_LOG}" 2>&1 &
   _PID=$!
@@ -51,8 +54,8 @@ ITEM_JSONL="${ITEM_JSONL:-/home/yuanhanyang.yhy/model_hub/amazon_user/raw/step4/
 OUT_DIR="${OUT_DIR:-/home/yuanhanyang.yhy/project_6_outputs}"
 SPLIT_DIR="${OUT_DIR}/split"
 SFT_JSONL="${OUT_DIR}/sft_from_chosen_title.jsonl"
-SFT_DIR="${OUT_DIR}/weights/sft_chosen_dpo/sft"
-DPO_DIR="${OUT_DIR}/weights/sft_chosen_dpo/dpo"
+SFT_DIR="${OUT_DIR}/weights/${VERSION}/sft"
+DPO_DIR="${OUT_DIR}/weights/${VERSION}/dpo"
 
 MAX_STEPS_SFT="${MAX_STEPS_SFT:-500}"
 MAX_STEPS_DPO="${MAX_STEPS_DPO:-1000}"
@@ -80,7 +83,7 @@ echo "  Base model: ${QWEN_BASE} (${BASE_MODEL_NAME})"
 echo "  DPO data: ${DPO_JSONL}"
 echo "  Output: ${OUT_DIR}"
 echo "  SFT steps: ${MAX_STEPS_SFT}, DPO steps: ${MAX_STEPS_DPO}"
-echo "  Log: ${LOG_DIR}/train_full_${BASE_MODEL_NAME}_sft_chosen.log"
+echo "  Log: ${LOG_DIR}/train_full_${BASE_MODEL_NAME}_${VERSION}.log"
 echo ""
 echo "  To stop: kill $"
 echo "============================================="
@@ -153,7 +156,7 @@ echo "SFT ckpt: ${SFT_DIR}/sid_sft.pt"
 echo "DPO ckpt: ${DPO_DIR}/sid_dpo.pt"
 echo "SFT loss curve: ${SFT_DIR}/sft_loss_curve.png"
 echo "DPO loss curve: ${DPO_DIR}/dpo_loss_curve.png"
-echo "Log: ${LOG_DIR}/train_full_${BASE_MODEL_NAME}.log"
+echo "Log: ${LOG_DIR}/train_full_${BASE_MODEL_NAME}_${VERSION}.log"
 echo "Test set: ${TEST_INFER_JSONL}"
 echo ""
 echo "To run evaluation: bash softprompt/run_eval.sh"
