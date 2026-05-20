@@ -65,6 +65,8 @@ MAX_LEN="${MAX_LEN:-2048}"
 MAX_CONTEXT_CHARS="${MAX_CONTEXT_CHARS:-0}"
 LR_SFT="${LR_SFT:-3e-5}"
 LR_DPO="${LR_DPO:-3e-5}"
+DPO_BETA="${DPO_BETA:-0.1}"
+DPO_SFT_COEF="${DPO_SFT_COEF:-0.0}"   # >0 开启 SFT 正则项, 推荐 0.1~0.5
 TEST_RATIO="${TEST_RATIO:-0.1}"
 SEED="${SEED:-42}"
 
@@ -145,6 +147,8 @@ python3 softprompt/train/train_dpo.py \
   --train-batch-size "${BATCH_DPO}" \
   --max-steps "${MAX_STEPS_DPO}" \
   --learning-rate "${LR_DPO}" \
+  --beta "${DPO_BETA}" \
+  --sft-coef "${DPO_SFT_COEF}" \
   --max-length "${MAX_LEN}" \
   --max-context-chars "${MAX_CONTEXT_CHARS}"
 

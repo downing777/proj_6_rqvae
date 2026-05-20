@@ -52,6 +52,27 @@ def load_jsonl(path: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def parse_and_strip_original_title(context: str) -> Tuple[str, str, bool]:
+    """同时拿到 original title 和"去掉该行后的 context"。
+
+    匹配规则: 行首 (允许前导空白) 以 'Original title:' 开头。只匹配第一处。
+    返回 (original_title, stripped_context, found)。
+      - found=True: 拿到了 original_title 且 stripped_context 是原 context 删该行后的结果
+      - found=False: 没找到, original_title="" 且 stripped_context 与原 context 相同
+    """
+    lines = context.split("\n")
+    keep: List[str] = []
+    title = ""
+    found = False
+    for line in lines:
+        if not found and line.lstrip().startswith("Original title:"):
+            title = line.lstrip()[len("Original title:"):].strip()
+            found = True
+            continue
+        keep.append(line)
+    return title, "\n".join(keep), found
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Build SFT data: SID prefix + context -> SID-personalized chosen title."
@@ -65,6 +86,23 @@ def main() -> None:
              "保留参数仅为了 run_train.sh 不用改。",
     )
     parser.add_argument("--out", type=str, required=True, help="输出 SFT JSONL 路径")
+    parser.add_argument(
+        "--target",
+        choices=["chosen", "original"],
+        default="chosen",
+        help="target_title 取什么: "
+             "'chosen' = title_chosen (默认, 与 DPO 对齐); "
+             "'original' = 从 context 里解析出的 Original title。"
+             "诊断实验时常配合 --no-use-ori-title 使用 (target=原始 + prompt 剥掉原始 = "
+             "真正考察模型是否在生成而非拷贝)。",
+    )
+    parser.add_argument(
+        "--use-ori-title",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否保留 context 中的 'Original title: ...' 行 (默认保留)。"
+             "传 --no-use-ori-title 关闭后, 该行会被从 context 删除。",
+    )
     args = parser.parse_args()
 
     if args.item_jsonl:
@@ -83,6 +121,9 @@ def main() -> None:
 
     skip_no_chosen = 0
     skip_bad_fields = 0
+    skip_no_original = 0
+    n_stripped = 0
+    n_no_ori_line = 0
 
     for row in dpo_rows:
         item_id = str(row.get("item_id", ""))
@@ -94,9 +135,31 @@ def main() -> None:
         if not item_id or not sid or not context:
             skip_bad_fields += 1
             continue
-        if not chosen:
-            skip_no_chosen += 1
-            continue
+
+        # 一次性解析: 拿到 original_title 和"去掉原标题行"的 context
+        original_title, stripped_context, found_original = parse_and_strip_original_title(context)
+
+        # 决定 target
+        if args.target == "chosen":
+            target = chosen
+            if not target:
+                skip_no_chosen += 1
+                continue
+        else:  # target == "original"
+            target = original_title
+            if not target:
+                skip_no_original += 1
+                continue
+
+        # 决定最终 context
+        if args.use_ori_title:
+            final_context = context
+        else:
+            final_context = stripped_context
+            if found_original:
+                n_stripped += 1
+            else:
+                n_no_ori_line += 1
 
         # 去重 key: (item_id, tuple(sid))
         try:
@@ -112,8 +175,8 @@ def main() -> None:
         sft_rows.append({
             "item_id": item_id,
             "sid": list(sid_tuple),
-            "context": context,
-            "target_title": chosen,
+            "context": final_context,
+            "target_title": target,
             "user_id": user_id,   # 同 (item, sid) 下首个见到的 user_id, 仅作 trace 参考, 训练不用
         })
 
@@ -123,12 +186,19 @@ def main() -> None:
         for row in sft_rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    print(f"\nSFT data generated (target = title_chosen):")
+    print(f"\nSFT data generated (target = {args.target}, "
+          f"use_ori_title = {args.use_ori_title}):")
     print(f"  Output: {args.out}")
     print(f"  Total rows: {len(sft_rows)}")
-    print(f"  Skipped (missing title_chosen): {skip_no_chosen}")
+    if args.target == "chosen":
+        print(f"  Skipped (missing title_chosen): {skip_no_chosen}")
+    else:
+        print(f"  Skipped (no 'Original title:' line / empty): {skip_no_original}")
     print(f"  Skipped (bad item_id/sid/context): {skip_bad_fields}")
     print(f"  Unique (item_id, sid) pairs: {len(seen_keys)}")
+    if not args.use_ori_title:
+        print(f"  'Original title:' line stripped: {n_stripped}")
+        print(f"  rows without 'Original title:' line found: {n_no_ori_line}")
     if dpo_rows:
         print(f"  Dedup ratio: {len(sft_rows)} / {len(dpo_rows)} = "
               f"{len(sft_rows)/len(dpo_rows):.1%}")

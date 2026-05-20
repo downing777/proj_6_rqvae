@@ -64,6 +64,14 @@ def main() -> None:
     parser.add_argument("--max-context-chars", type=int, default=0)
     parser.add_argument("--max-steps", type=int, required=True, help="优化器步数, 到即停(数据可多轮扫)。")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--beta", type=float, default=0.1, help="DPO 温度系数 β。")
+    parser.add_argument(
+        "--sft-coef",
+        type=float,
+        default=0.0,
+        help="SFT 正则项系数 α: total_loss = dpo_loss + α * NLL(chosen). "
+             "0 = 关闭; 推荐 0.1~0.5, 用于把 policy 锚在 SFT 行为附近防 collapse。",
+    )
     parser.add_argument(
         "--no-freeze-backbone",
         action="store_true",
@@ -141,7 +149,8 @@ def main() -> None:
             chosen = batch["chosen"]
             rejected = batch["rejected"]
 
-            pi_chosen, _, _ = sequence_logp(
+            # policy 在 chosen 上的 forward 同时拿 out_chosen, 复用其 loss 作为 SFT 正则项
+            pi_chosen, out_chosen, _ = sequence_logp(
                 model=model,
                 tokenizer=tokenizer,
                 sid=sid,
@@ -175,13 +184,17 @@ def main() -> None:
                     max_length=args.max_length,
                 )
 
-            loss = dpo_loss(
+            dpo_term = dpo_loss(
                 pi_chosen=pi_chosen,
                 pi_rejected=pi_rejected,
                 ref_chosen=ref_chosen,
                 ref_rejected=ref_rejected,
-                beta=0.1,
+                beta=args.beta,
             )
+            # SFT 正则: 用 policy 在 chosen 上的 token-mean NLL (HF 自带 out.loss),
+            # 锚住 policy 不要漂离能生成 chosen 的分布; 与 DPO 梯度互补
+            sft_term = out_chosen.loss if args.sft_coef > 0 else None
+            loss = dpo_term if sft_term is None else dpo_term + args.sft_coef * sft_term
             if not torch.isfinite(loss):
                 print("[dpo] skip non-finite loss (调 max-length / max-context-chars).")
                 continue
@@ -193,7 +206,14 @@ def main() -> None:
             optimizer.step()
             global_step += 1
             loss_val = loss.item()
-            loss_history.append({"step": global_step, "loss": loss_val})
+            dpo_val = dpo_term.item()
+            sft_val = sft_term.item() if sft_term is not None else 0.0
+            loss_history.append({
+                "step": global_step,
+                "loss": loss_val,
+                "dpo": dpo_val,
+                "sft": sft_val,
+            })
 
             _recent_losses.append(loss_val)
             if len(_recent_losses) > _avg_window:
@@ -201,12 +221,18 @@ def main() -> None:
             avg_loss = sum(_recent_losses) / len(_recent_losses)
 
             pbar.update(1)
-            pbar.set_postfix(loss=f"{loss_val:.4f}", avg=f"{avg_loss:.4f}")
+            pbar.set_postfix(
+                loss=f"{loss_val:.4f}",
+                dpo=f"{dpo_val:.4f}",
+                sft=f"{sft_val:.4f}",
+                avg=f"{avg_loss:.4f}",
+            )
 
             if global_step % 10 == 0 or global_step >= args.max_steps:
                 tqdm.write(
                     f"[dpo] step={global_step}/{args.max_steps} "
-                    f"loss={loss_val:.4f} avg{_avg_window}={avg_loss:.4f}"
+                    f"loss={loss_val:.4f} dpo={dpo_val:.4f} sft={sft_val:.4f} "
+                    f"avg{_avg_window}={avg_loss:.4f}"
                 )
             if global_step >= args.max_steps:
                 break
