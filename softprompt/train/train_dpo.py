@@ -18,6 +18,7 @@ from softprompt.train.common import (
     DPOJsonlDataset,
     collated_sid_to_tensor,
     load_jsonl,
+    preview_training_samples,
     sequence_logp,
     truncate_context_in_rows,
 )
@@ -44,7 +45,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="DPO: 只更新 SID 软前缀(默认冻结基座)。")
     parser.add_argument("--train-jsonl", type=str, required=True)
     parser.add_argument("--base-model", type=str, required=True)
-    parser.add_argument("--sft-ckpt", type=str, required=True)
+    parser.add_argument(
+        "--sft-ckpt",
+        type=str,
+        default=None,
+        help="SFT checkpoint to initialize sid_prefix from. "
+             "省略 / 留空 = 从随机初始化的 prefix 开始 (DPO from scratch)。",
+    )
     parser.add_argument("--output-dir", type=str, default="softprompt/outputs/dpo")
     parser.add_argument("--sid-dims", type=str, default="32,32,32")
     parser.add_argument("--sid-embed-dim", type=int, default=64)
@@ -77,6 +84,9 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # 训练开始前肉眼检查 chosen/rejected 拼接是否符合预期 (差异 / 长度 / EOS)
+    preview_training_samples(dataset, kind="DPO", tokenizer=tokenizer, n=2)
+
     cfg = SidModelLoadConfig(
         base_model_name_or_path=args.base_model,
         sid_dims=tuple(parse_sid_dims(args.sid_dims)),
@@ -85,8 +95,14 @@ def main() -> None:
         num_basis_tokens=args.num_basis_tokens,
     )
     model = build_sid_model(cfg, device=str(device))
-    sft_state = torch.load(args.sft_ckpt, map_location="cpu")
-    model.sid_prefix.load_state_dict(sft_state["sid_prefix"], strict=True)
+    if args.sft_ckpt:
+        sft_state = torch.load(args.sft_ckpt, map_location="cpu")
+        model.sid_prefix.load_state_dict(sft_state["sid_prefix"], strict=True)
+        print(f"Loaded sid_prefix from SFT ckpt: {args.sft_ckpt}")
+    else:
+        # 从零开始 DPO: prefix 用 SidPrefixEncoder 的默认随机初始化
+        # ref_model 后面会 deepcopy policy 的 state, 所以两者起步仍然完全一致, DPO 数学不变
+        print("DPO from scratch: sid_prefix uses random init (no SFT load).")
     if freeze:
         model.freeze_backbone()
         print("Backbone frozen: DPO on SidPrefix; ref 同步。")

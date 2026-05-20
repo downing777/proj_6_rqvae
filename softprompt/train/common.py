@@ -11,7 +11,7 @@ import re as _re
 PROMPT_TEMPLATE = (
     "You are a product title generator.\n"
     "Product info: {context}\n"
-    "Generate a short, compelling English product title for the target SID user group:"
+    "Generate a short, personalized product title for specific user group."
 )
 
 
@@ -56,6 +56,68 @@ def truncate_context_in_rows(
 
 def render_prompt(context: str) -> str:
     return PROMPT_TEMPLATE.format(context=context)
+
+
+def preview_training_samples(dataset, kind: str, tokenizer, n: int = 2) -> None:
+    """
+    在训练正式开始前打印 n 条样本, 用于人工 sanity check:
+      - prompt 是不是最终送进 tokenizer 的样子 (含模板拼接)
+      - target / chosen / rejected 跟预期一致
+      - 哪部分会被 mask (-100, 不算 loss), 哪部分会被监督
+      - 整段 token 数, 防止 max_length 被静默截断
+
+    kind: "SFT" 或 "DPO" —— 决定打印哪些字段。
+    """
+    assert kind in ("SFT", "DPO"), f"unknown kind: {kind}"
+    eos = tokenizer.eos_token or ""
+    bar = "=" * 70
+    sep = "─" * 70
+
+    print()
+    print(bar)
+    print(f"  Preview {min(n, len(dataset))} {kind} training samples (pre-tokenize)")
+    print(bar)
+
+    for i in range(min(n, len(dataset))):
+        s = dataset[i]
+        print()
+        print(f"[Sample {i + 1}]  sid={s['sid']}")
+        print(sep)
+        print("PROMPT (will be masked, labels=-100):")
+        print(s["prompt"])
+        if kind == "SFT":
+            full_target = f"\nTitle: {s['target']}{eos}"
+            print(sep)
+            print(r"TARGET (supervised, after the literal '\nTitle: ' separator):")
+            print(full_target)
+            n_tok_full = len(
+                tokenizer(s["prompt"] + full_target, add_special_tokens=False).input_ids
+            )
+            n_tok_target = len(
+                tokenizer(full_target, add_special_tokens=False).input_ids
+            )
+            print(sep)
+            print(f"tokens: total ≈ {n_tok_full}  (target+eos ≈ {n_tok_target})")
+        else:  # DPO
+            chosen_text   = f"\nTitle: {s['chosen']}{eos}"
+            rejected_text = f"\nTitle: {s['rejected']}{eos}"
+            print(sep)
+            print("CHOSEN (supervised when computing pi_chosen / ref_chosen):")
+            print(chosen_text)
+            print(sep)
+            print("REJECTED (supervised when computing pi_rejected / ref_rejected):")
+            print(rejected_text)
+            n_tok_prompt   = len(tokenizer(s["prompt"], add_special_tokens=False).input_ids)
+            n_tok_chosen   = len(tokenizer(chosen_text, add_special_tokens=False).input_ids)
+            n_tok_rejected = len(tokenizer(rejected_text, add_special_tokens=False).input_ids)
+            print(sep)
+            print(
+                f"tokens: prompt ≈ {n_tok_prompt}  "
+                f"chosen+eos ≈ {n_tok_chosen}  rejected+eos ≈ {n_tok_rejected}"
+            )
+
+    print(bar)
+    print()
 
 
 @dataclass

@@ -17,6 +17,7 @@ from softprompt.train.common import (
     build_prompt_target_tensors,
     collated_sid_to_tensor,
     load_jsonl,
+    preview_training_samples,
     truncate_context_in_rows,
 )
 
@@ -60,6 +61,9 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    # 训练开始前肉眼检查样本拼接是否符合预期 (mask 边界 / EOS / token 数)
+    preview_training_samples(dataset, kind="SFT", tokenizer=tokenizer, n=2)
 
     model = build_sid_model(
         SidModelLoadConfig(

@@ -87,22 +87,38 @@ echo "============================================="
 echo ""
 
 # ---- 0) 划分 train/test (按 (user_id, item_id) pair 级别随机划分)
-echo "---- [0/3] Splitting train/test ----"
-python3 softprompt/data/split_data.py \
-  --input-jsonl "${DPO_JSONL}" \
-  --output-dir "${SPLIT_DIR}" \
-  --test-ratio "${TEST_RATIO}" \
-  --seed "${SEED}"
-
 TRAIN_DPO_JSONL="${SPLIT_DIR}/train.jsonl"
+TEST_DPO_JSONL="${SPLIT_DIR}/test.jsonl"
 TEST_INFER_JSONL="${SPLIT_DIR}/test_infer.jsonl"
 
+if [[ -s "${TRAIN_DPO_JSONL}" && -s "${TEST_DPO_JSONL}" && -s "${TEST_INFER_JSONL}" \
+      && "${FORCE_SPLIT:-0}" != "1" ]]; then
+  echo "---- [0/3] Skip split: existing non-empty files detected ----"
+  echo "  ${TRAIN_DPO_JSONL}    ($(wc -l < "${TRAIN_DPO_JSONL}") lines)"
+  echo "  ${TEST_DPO_JSONL}     ($(wc -l < "${TEST_DPO_JSONL}") lines)"
+  echo "  ${TEST_INFER_JSONL}   ($(wc -l < "${TEST_INFER_JSONL}") lines)"
+  echo "  (set FORCE_SPLIT=1 to re-split from ${DPO_JSONL})"
+else
+  echo "---- [0/3] Splitting train/test ----"
+  python3 softprompt/data/split_data.py \
+    --input-jsonl "${DPO_JSONL}" \
+    --output-dir "${SPLIT_DIR}" \
+    --test-ratio "${TEST_RATIO}" \
+    --seed "${SEED}"
+fi
+
 # ---- 1) SFT 语料 (仅使用训练集)
-echo "---- [1/3] Building SFT data ----"
-python3 softprompt/data/build_sft_from_dpo.py \
-  --dpo-jsonl "${TRAIN_DPO_JSONL}" \
-  --item-jsonl "${ITEM_JSONL}" \
-  --out "${SFT_JSONL}"
+if [[ -s "${SFT_JSONL}" && "${FORCE_REBUILD_SFT_DATA:-0}" != "1" ]]; then
+  echo "---- [1/3] Skip SFT data build: existing non-empty file detected ----"
+  echo "  ${SFT_JSONL}  ($(wc -l < "${SFT_JSONL}") lines)"
+  echo "  (set FORCE_REBUILD_SFT_DATA=1 to rebuild)"
+else
+  echo "---- [1/3] Building SFT data ----"
+  python3 softprompt/data/build_sft_from_dpo.py \
+    --dpo-jsonl "${TRAIN_DPO_JSONL}" \
+    --item-jsonl "${ITEM_JSONL}" \
+    --out "${SFT_JSONL}"
+fi
 
 # ---- 2) SFT
 echo "---- [2/3] SFT Training ----"
