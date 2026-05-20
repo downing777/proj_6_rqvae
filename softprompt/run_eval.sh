@@ -51,14 +51,14 @@ fi
 SPLIT_DIR="${OUT_DIR}/split"
 EVAL_DIR="${OUT_DIR}/eval"
 SFT_DIR="${OUT_DIR}/sft"
-DPO_DIR="${OUT_DIR}/dpo"
+DPO_DIR="${OUT_DIR}/weights/dpo_only"
 
 TEST_INFER_JSONL="${SPLIT_DIR}/test_infer.jsonl"
 TEST_DPO_JSONL="${SPLIT_DIR}/test.jsonl"
 
 # Prediction files
 PRED_SFT="${EVAL_DIR}/predictions_sft.jsonl"
-PRED_DPO="${EVAL_DIR}/predictions_dpo.jsonl"
+PRED_DPO="${EVAL_DIR}/predictions_dpo_only.jsonl"
 
 # Checkpoints
 SFT_CKPT="${SFT_DIR}/sid_sft.pt"
@@ -102,46 +102,46 @@ fi
 # ======================================================================
 # Step 1: SFT Prediction (generate if not exist) — NO LLM judge
 # ======================================================================
-echo "---- [1/3] SFT Prediction ----"
-if [[ -f "${PRED_SFT}" ]]; then
-  echo "  Found existing: ${PRED_SFT} ($(wc -l < "${PRED_SFT}") lines)"
-  echo "  Skipping generation. Delete the file to regenerate."
-elif [[ ! -f "${SFT_CKPT}" ]]; then
-  echo "  SKIPPED: SFT checkpoint not found (${SFT_CKPT})"
-  echo "  Please run run_train.sh to train SFT first."
-else
-  echo "  Generating SFT predictions (sampling ${EVAL_SAMPLES} from test set)..."
-  python3 softprompt/infer/generate_title.py \
-    --input-jsonl "${TEST_INFER_JSONL}" \
-    --base-model "${QWEN_BASE}" \
-    --sid-ckpt "${SFT_CKPT}" \
-    --output-jsonl "${PRED_SFT}" \
-    --max-new-tokens "${MAX_NEW_TOKENS}" \
-    --temperature "${TEMPERATURE}" \
-    --max-samples "${EVAL_SAMPLES}" \
-    --seed "${SEED}"
-  echo "  Done: ${PRED_SFT} ($(wc -l < "${PRED_SFT}") lines)"
-fi
-echo ""
+# echo "---- [1/3] SFT Prediction ----"
+# if [[ -f "${PRED_SFT}" ]]; then
+#   echo "  Found existing: ${PRED_SFT} ($(wc -l < "${PRED_SFT}") lines)"
+#   echo "  Skipping generation. Delete the file to regenerate."
+# elif [[ ! -f "${SFT_CKPT}" ]]; then
+#   echo "  SKIPPED: SFT checkpoint not found (${SFT_CKPT})"
+#   echo "  Please run run_train.sh to train SFT first."
+# else
+#   echo "  Generating SFT predictions (sampling ${EVAL_SAMPLES} from test set)..."
+#   python3 softprompt/infer/generate_title.py \
+#     --input-jsonl "${TEST_INFER_JSONL}" \
+#     --base-model "${QWEN_BASE}" \
+#     --sid-ckpt "${SFT_CKPT}" \
+#     --output-jsonl "${PRED_SFT}" \
+#     --max-new-tokens "${MAX_NEW_TOKENS}" \
+#     --temperature "${TEMPERATURE}" \
+#     --max-samples "${EVAL_SAMPLES}" \
+#     --seed "${SEED}"
+#   echo "  Done: ${PRED_SFT} ($(wc -l < "${PRED_SFT}") lines)"
+# fi
+# echo ""
 
 # Show SFT samples (visual inspection only, no judge)
-if [[ -f "${PRED_SFT}" ]]; then
-  echo "  SFT Sample Outputs (first 10):"
-  echo "  ────────────────────────────────────────"
-  head -10 "${PRED_SFT}" | python3 -c "
-import sys, json
-for i, line in enumerate(sys.stdin, 1):
-    row = json.loads(line.strip())
-    sid = row.get('sid', [])
-    title = row.get('generated_text', '')
-    item_id = row.get('item_id', '')
-    print(f'  {i:2d}. item={item_id}  sid={sid}')
-    print(f'      => {title}')
-" 2>/dev/null || head -10 "${PRED_SFT}"
-  echo "  ────────────────────────────────────────"
-  echo "  (SFT: visual inspection only, no LLM judge)"
-fi
-echo ""
+# if [[ -f "${PRED_SFT}" ]]; then
+#   echo "  SFT Sample Outputs (first 10):"
+#   echo "  ────────────────────────────────────────"
+#   head -10 "${PRED_SFT}" | python3 -c "
+# import sys, json
+# for i, line in enumerate(sys.stdin, 1):
+#     row = json.loads(line.strip())
+#     sid = row.get('sid', [])
+#     title = row.get('generated_text', '')
+#     item_id = row.get('item_id', '')
+#     print(f'  {i:2d}. item={item_id}  sid={sid}')
+#     print(f'      => {title}')
+# " 2>/dev/null || head -10 "${PRED_SFT}"
+#   echo "  ────────────────────────────────────────"
+#   echo "  (SFT: visual inspection only, no LLM judge)"
+# fi
+# echo ""
 
 # ======================================================================
 # Step 2: DPO Prediction (generate if not exist)

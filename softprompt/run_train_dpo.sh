@@ -59,7 +59,7 @@ fi
 QWEN_BASE="${QWEN_BASE:-/home/yuanhanyang.yhy/model_hub/Qwen3.5-9B}"
 OUT_DIR="${OUT_DIR:-/home/yuanhanyang.yhy/project_6_outputs}"
 SPLIT_DIR="${OUT_DIR}/split"
-DPO_DIR="${OUT_DIR}/dpo_only"
+DPO_DIR="${OUT_DIR}/weights/dpo_only"
 
 TRAIN_DPO_JSONL="${SPLIT_DIR}/train.jsonl"
 
