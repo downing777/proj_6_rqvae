@@ -24,14 +24,17 @@ conda activate softprompt
 QWEN_BASE="${QWEN_BASE:-/home/yuanhanyang.yhy/model_hub/Qwen3.5-9B}"
 OUT_DIR="${OUT_DIR:-/home/yuanhanyang.yhy/project_6_outputs}"
 
+# ---- 版本标识: 必须与 run_train.sh 中的 VERSION 一致, 用于定位权重和区分 eval 输出 ----
+VERSION="${VERSION:-sft_chosen_dpo}"
+
 # ---- Auto-nohup: 直接 bash run_eval.sh 即可后台运行 ----
 if [[ -z "${_EVAL_NOHUP_WRAPPER:-}" ]]; then
   export _EVAL_NOHUP_WRAPPER=1
   _BASE_MODEL_NAME="$(basename "${QWEN_BASE}")"
   _LOG_DIR="${OUT_DIR}/logs/${_BASE_MODEL_NAME}"
   mkdir -p "${_LOG_DIR}"
-  _FULL_LOG="${_LOG_DIR}/eval_full_${_BASE_MODEL_NAME}.log"
-  _PIDFILE="${_LOG_DIR}/eval_${_BASE_MODEL_NAME}.pid"
+  _FULL_LOG="${_LOG_DIR}/eval_full_${_BASE_MODEL_NAME}_${VERSION}.log"
+  _PIDFILE="${_LOG_DIR}/eval_${_BASE_MODEL_NAME}_${VERSION}.pid"
 
   nohup bash "$0" "$@" >> "${_FULL_LOG}" 2>&1 &
   _PID=$!
@@ -50,15 +53,15 @@ if [[ -z "${_EVAL_NOHUP_WRAPPER:-}" ]]; then
 fi
 SPLIT_DIR="${OUT_DIR}/split"
 EVAL_DIR="${OUT_DIR}/eval"
-SFT_DIR="${OUT_DIR}/sft"
-DPO_DIR="${OUT_DIR}/weights/dpo_only"
+SFT_DIR="${OUT_DIR}/weights/${VERSION}/sft"
+DPO_DIR="${OUT_DIR}/weights/${VERSION}/dpo"
 
 TEST_INFER_JSONL="${SPLIT_DIR}/test_infer.jsonl"
 TEST_DPO_JSONL="${SPLIT_DIR}/test.jsonl"
 
 # Prediction files
-PRED_SFT="${EVAL_DIR}/predictions_sft.jsonl"
-PRED_DPO="${EVAL_DIR}/predictions_dpo_only.jsonl"
+PRED_SFT="${EVAL_DIR}/predictions_sft_${VERSION}.jsonl"
+PRED_DPO="${EVAL_DIR}/predictions_dpo_${VERSION}.jsonl"
 
 # Checkpoints
 SFT_CKPT="${SFT_DIR}/sid_sft.pt"
@@ -102,46 +105,46 @@ fi
 # ======================================================================
 # Step 1: SFT Prediction (generate if not exist) — NO LLM judge
 # ======================================================================
-# echo "---- [1/3] SFT Prediction ----"
-# if [[ -f "${PRED_SFT}" ]]; then
-#   echo "  Found existing: ${PRED_SFT} ($(wc -l < "${PRED_SFT}") lines)"
-#   echo "  Skipping generation. Delete the file to regenerate."
-# elif [[ ! -f "${SFT_CKPT}" ]]; then
-#   echo "  SKIPPED: SFT checkpoint not found (${SFT_CKPT})"
-#   echo "  Please run run_train.sh to train SFT first."
-# else
-#   echo "  Generating SFT predictions (sampling ${EVAL_SAMPLES} from test set)..."
-#   python3 softprompt/infer/generate_title.py \
-#     --input-jsonl "${TEST_INFER_JSONL}" \
-#     --base-model "${QWEN_BASE}" \
-#     --sid-ckpt "${SFT_CKPT}" \
-#     --output-jsonl "${PRED_SFT}" \
-#     --max-new-tokens "${MAX_NEW_TOKENS}" \
-#     --temperature "${TEMPERATURE}" \
-#     --max-samples "${EVAL_SAMPLES}" \
-#     --seed "${SEED}"
-#   echo "  Done: ${PRED_SFT} ($(wc -l < "${PRED_SFT}") lines)"
-# fi
-# echo ""
+echo "---- [1/3] SFT Prediction ----"
+if [[ -f "${PRED_SFT}" ]]; then
+  echo "  Found existing: ${PRED_SFT} ($(wc -l < "${PRED_SFT}") lines)"
+  echo "  Skipping generation. Delete the file to regenerate."
+elif [[ ! -f "${SFT_CKPT}" ]]; then
+  echo "  SKIPPED: SFT checkpoint not found (${SFT_CKPT})"
+  echo "  Please run run_train.sh to train SFT first."
+else
+  echo "  Generating SFT predictions (sampling ${EVAL_SAMPLES} from test set)..."
+  python3 softprompt/infer/generate_title.py \
+    --input-jsonl "${TEST_INFER_JSONL}" \
+    --base-model "${QWEN_BASE}" \
+    --sid-ckpt "${SFT_CKPT}" \
+    --output-jsonl "${PRED_SFT}" \
+    --max-new-tokens "${MAX_NEW_TOKENS}" \
+    --temperature "${TEMPERATURE}" \
+    --max-samples "${EVAL_SAMPLES}" \
+    --seed "${SEED}"
+  echo "  Done: ${PRED_SFT} ($(wc -l < "${PRED_SFT}") lines)"
+fi
+echo ""
 
 # Show SFT samples (visual inspection only, no judge)
-# if [[ -f "${PRED_SFT}" ]]; then
-#   echo "  SFT Sample Outputs (first 10):"
-#   echo "  ────────────────────────────────────────"
-#   head -10 "${PRED_SFT}" | python3 -c "
-# import sys, json
-# for i, line in enumerate(sys.stdin, 1):
-#     row = json.loads(line.strip())
-#     sid = row.get('sid', [])
-#     title = row.get('generated_text', '')
-#     item_id = row.get('item_id', '')
-#     print(f'  {i:2d}. item={item_id}  sid={sid}')
-#     print(f'      => {title}')
-# " 2>/dev/null || head -10 "${PRED_SFT}"
-#   echo "  ────────────────────────────────────────"
-#   echo "  (SFT: visual inspection only, no LLM judge)"
-# fi
-# echo ""
+if [[ -f "${PRED_SFT}" ]]; then
+  echo "  SFT Sample Outputs (first 10):"
+  echo "  ────────────────────────────────────────"
+  head -10 "${PRED_SFT}" | python3 -c "
+import sys, json
+for i, line in enumerate(sys.stdin, 1):
+    row = json.loads(line.strip())
+    sid = row.get('sid', [])
+    title = row.get('generated_text', '')
+    item_id = row.get('item_id', '')
+    print(f'  {i:2d}. item={item_id}  sid={sid}')
+    print(f'      => {title}')
+" 2>/dev/null || head -10 "${PRED_SFT}"
+  echo "  ────────────────────────────────────────"
+  echo "  (SFT: visual inspection only, no LLM judge)"
+fi
+echo ""
 
 # ======================================================================
 # Step 2: DPO Prediction (generate if not exist)
@@ -176,8 +179,8 @@ if [[ ! -f "${PRED_DPO}" ]]; then
   echo "  SKIPPED: DPO predictions not available."
   EVAL_DPO="(not generated)"
 else
-  EVAL_DPO="${EVAL_DIR}/eval_results_dpo.jsonl"
-  SUMMARY_DPO="${EVAL_DIR}/eval_summary_dpo.json"
+  EVAL_DPO="${EVAL_DIR}/eval_results_dpo_${VERSION}.jsonl"
+  SUMMARY_DPO="${EVAL_DIR}/eval_summary_dpo_${VERSION}.json"
   echo "  Running LLM judge on DPO predictions..."
   echo "  Judge model: ${JUDGE_MODEL} @ ${JUDGE_BASE_URL}"
   python3 softprompt/eval/offline_eval.py \
@@ -201,12 +204,12 @@ echo "  SFT predictions: ${PRED_SFT}"
 echo "    (visual inspection only — no LLM judge)"
 echo "  DPO predictions: ${PRED_DPO}"
 echo "  DPO eval results: ${EVAL_DPO}"
-if [[ -f "${EVAL_DIR}/eval_summary_dpo.json" ]]; then
+if [[ -f "${EVAL_DIR}/eval_summary_dpo_${VERSION}.json" ]]; then
   echo ""
   echo "  DPO Summary:"
   python3 -c "
 import json
-with open('${EVAL_DIR}/eval_summary_dpo.json') as f:
+with open('${EVAL_DIR}/eval_summary_dpo_${VERSION}.json') as f:
     s = json.load(f)
 o = s.get('overall', {})
 print(f'    Samples: {s.get(\"sample_count\", 0)}')
@@ -214,7 +217,7 @@ print(f'    Generated win: {o.get(\"generated_win_rate\", 0):.1%}')
 print(f'    Tie: {o.get(\"tie_rate\", 0):.1%}')
 print(f'    Original win: {o.get(\"original_win_rate\", 0):.1%}')
 print(f'    Strict win rate: {s.get(\"strict_win_rate\", 0):.1%}')
-" 2>/dev/null || echo "    (see ${EVAL_DIR}/eval_summary_dpo.json)"
+" 2>/dev/null || echo "    (see ${EVAL_DIR}/eval_summary_dpo_${VERSION}.json)"
 fi
 echo ""
 echo "  To view samples: head -5 ${PRED_DPO}"

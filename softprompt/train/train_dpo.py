@@ -8,6 +8,7 @@ from typing import Dict, List
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 if __package__ is None or __package__ == "":
@@ -122,6 +123,15 @@ def main() -> None:
     loss_history: List[Dict[str, float]] = []
 
     global_step = 0
+    pbar = tqdm(
+        total=args.max_steps,
+        desc="DPO",
+        mininterval=5.0,
+        dynamic_ncols=True,
+    )
+    _avg_window = 50
+    _recent_losses: List[float] = []
+
     while global_step < args.max_steps:
         for batch in loader:
             if global_step >= args.max_steps:
@@ -184,12 +194,26 @@ def main() -> None:
             global_step += 1
             loss_val = loss.item()
             loss_history.append({"step": global_step, "loss": loss_val})
+
+            _recent_losses.append(loss_val)
+            if len(_recent_losses) > _avg_window:
+                _recent_losses.pop(0)
+            avg_loss = sum(_recent_losses) / len(_recent_losses)
+
+            pbar.update(1)
+            pbar.set_postfix(loss=f"{loss_val:.4f}", avg=f"{avg_loss:.4f}")
+
             if global_step % 10 == 0 or global_step >= args.max_steps:
-                print(f"[dpo] step={global_step}/{args.max_steps} loss={loss_val:.4f}")
+                tqdm.write(
+                    f"[dpo] step={global_step}/{args.max_steps} "
+                    f"loss={loss_val:.4f} avg{_avg_window}={avg_loss:.4f}"
+                )
             if global_step >= args.max_steps:
                 break
         if global_step >= args.max_steps:
             break
+
+    pbar.close()
 
     # Save loss history and plot
     loss_json_path = os.path.join(args.output_dir, "dpo_loss_history.json")

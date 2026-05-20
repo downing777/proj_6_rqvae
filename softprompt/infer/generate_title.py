@@ -5,6 +5,7 @@ import sys
 from typing import Dict, List
 
 import torch
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 if __package__ is None or __package__ == "":
@@ -89,7 +90,14 @@ def main() -> None:
           f"max_input_length={args.max_input_length}, temperature={args.temperature}")
 
     with open(args.output_jsonl, "w", encoding="utf-8") as f:
-        for idx, row in enumerate(rows, 1):
+        pbar = tqdm(
+            enumerate(rows, 1),
+            total=total,
+            desc="generate",
+            mininterval=2.0,
+            dynamic_ncols=True,
+        )
+        for idx, row in pbar:
             sid = torch.tensor([row["sid"]], dtype=torch.long, device=args.device)
             # 注: 必须与训练时 prompt_only 的拼接保持一致 (common.py:build_prompt_target_tensors),
             # prompt 截止在 ":" (无尾空格)。
@@ -129,8 +137,10 @@ def main() -> None:
                 )
                 + "\n"
             )
+            pbar.set_postfix_str(f"{text[:40]}", refresh=False)
             if idx % 10 == 0 or idx == total:
-                print(f"  [{idx}/{total}] item={row['item_id']} => {text[:60]}")
+                tqdm.write(f"  [{idx}/{total}] item={row['item_id']} => {text[:60]}")
+        pbar.close()
 
     print(f"Saved predictions to: {args.output_jsonl}")
 
