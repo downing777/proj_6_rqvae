@@ -215,11 +215,15 @@ def main() -> None:
               f"这些 SID 的行将退化为 skip 处理。")
 
     # 3) 逐行重写 title_rejected
+    # 严格 1:1: 每个 (item, sid) 在输出里只出现 1 次。原始 1:N 数据会被去重,
+    # 因为 far_sid 是 deterministic 的, 不去重就会写出 N 份完全相同的行。
     out_rows: List[Dict[str, Any]] = []
+    seen_out_keys: set = set()
     skip_no_other_sid = 0
     skip_no_emb = 0
     skip_dup_chosen = 0
     skip_bad_fields = 0
+    skip_dedup = 0
 
     for r in rows:
         item = str(r.get("item_id", ""))
@@ -232,6 +236,13 @@ def main() -> None:
         if not item or not chosen:
             skip_bad_fields += 1
             continue
+
+        # 同一 (item, sid) 只保留第一次出现
+        out_key = (item, sid)
+        if out_key in seen_out_keys:
+            skip_dedup += 1
+            continue
+        seen_out_keys.add(out_key)
 
         others = [s for s in item_to_sids[item] if s != sid]
         if not others:
@@ -275,6 +286,7 @@ def main() -> None:
     print(f"\nWrote {len(out_rows)} rows to {args.out}")
     print(f"  input rows:            {len(rows)}")
     print(f"  output (1:1) rows:     {len(out_rows)}")
+    print(f"  skipped dedup:         {skip_dedup}   (同一 (item, sid) 已经写过, 1:N 数据会折叠成 1:1)")
     print(f"  skipped no-other-sid:  {skip_no_other_sid}  (同 item 下只有 1 个 SID)")
     print(f"  skipped no-embedding:  {skip_no_emb}    (锚 SID 或所有候选 SID 在 user 数据里没出现)")
     print(f"  skipped dup-chosen:    {skip_dup_chosen}    (最远 SID 的 chosen 和正例字面相同)")
