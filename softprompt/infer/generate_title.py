@@ -29,6 +29,20 @@ def load_jsonl(path: str) -> List[Dict[str, object]]:
     return rows
 
 
+def extract_original_title(context: str) -> str:
+    """从 context 里抽 'Original title: ...' 行 (大小写不敏感, 允许行首空白)。
+
+    给 offline_eval 的 LLM judge 用; judge 比较的对手就是原标题。
+    """
+    if not context:
+        return ""
+    for line in context.split("\n"):
+        s = line.lstrip()
+        if s[:15].lower() == "original title:":
+            return s[15:].strip()
+    return ""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate one best title for each (item, sid).")
     parser.add_argument("--input-jsonl", type=str, required=True)
@@ -125,6 +139,8 @@ def main() -> None:
             new_tokens = generated[:, input_len:]
             text = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)[0].strip()
             text = strip_thinking_tags(text)
+            # original_title 直接落字段, judge/下游不用再 grep context 解析
+            original_title = (row.get("original_title") or "").strip() or extract_original_title(row["context"])
             f.write(
                 json.dumps(
                     {
@@ -132,6 +148,7 @@ def main() -> None:
                         "sid": row["sid"],
                         "context": row["context"],
                         "generated_text": text,
+                        "original_title": original_title,
                     },
                     ensure_ascii=False,
                 )

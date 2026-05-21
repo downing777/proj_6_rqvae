@@ -125,6 +125,7 @@ _TITLE_PATTERNS = [
     re.compile(r"原商品标题\(英文\):\s*(.+)"),
     re.compile(r"原商品标题:\s*(.+)"),
     re.compile(r"商品标题:\s*(.+)"),
+    re.compile(r"Original title:\s*(.+)", re.IGNORECASE),  # 当前英文 context 格式
 ]
 
 
@@ -213,7 +214,13 @@ def build_samples(
         gen_title = strip_prompt_prefix(gen_text, context)
         if not gen_title:
             continue
-        original = extract_original_title(context) or fallback_original_title
+        # 优先读 prediction 文件里 generate_title.py 直接落的字段; 兜底再做正则解析。
+        # 这样新 predictions (含字段) / 老 predictions (只有 context) 都能 judge。
+        original = (
+            (r.get("original_title") or "").strip()
+            or extract_original_title(context)
+            or fallback_original_title
+        )
         if not original:
             continue
         ref_chosen = None
