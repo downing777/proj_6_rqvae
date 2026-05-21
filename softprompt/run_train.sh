@@ -18,7 +18,7 @@ eval "$(conda shell.bash hook)"
 conda activate softprompt
 
 # ---- 版本标识: 用于区分不同实验, 会作为后缀附加到 log/weight 文件名上 ----
-VERSION="${VERSION:-sft_chosen_dpo}"
+VERSION="${VERSION:-sft_dpo_ref02}"
 
 # ---- Auto-nohup: 如果不是被 nohup 调用的，则自动用 nohup 重启自己 ----
 if [[ -z "${_TRAIN_NOHUP_WRAPPER:-}" ]]; then
@@ -57,20 +57,20 @@ SFT_JSONL="${OUT_DIR}/sft_from_chosen_title.jsonl"
 SFT_DIR="${OUT_DIR}/weights/${VERSION}/sft"
 DPO_DIR="${OUT_DIR}/weights/${VERSION}/dpo"
 
-MAX_STEPS_SFT="${MAX_STEPS_SFT:-500}"
+MAX_STEPS_SFT="${MAX_STEPS_SFT:-1000}"
 MAX_STEPS_DPO="${MAX_STEPS_DPO:-1000}"
 BATCH_SFT="${BATCH_SFT:-2}"
-BATCH_DPO="${BATCH_DPO:-1}"
+BATCH_DPO="${BATCH_DPO:-2}"
 MAX_LEN="${MAX_LEN:-2048}"
 MAX_CONTEXT_CHARS="${MAX_CONTEXT_CHARS:-0}"
-LR_SFT="${LR_SFT:-3e-5}"
-LR_DPO="${LR_DPO:-3e-5}"
+LR_SFT="${LR_SFT:-3e-6}"
+LR_DPO="${LR_DPO:-3e-6}"
 DPO_BETA="${DPO_BETA:-0.1}"
-DPO_SFT_COEF="${DPO_SFT_COEF:-0.0}"   # >0 开启 SFT 正则项, 推荐 0.1~0.5
+DPO_SFT_COEF="${DPO_SFT_COEF:-0.2}"   # >0 开启 SFT 正则项, 推荐 0.1~0.5
 TEST_RATIO="${TEST_RATIO:-0.1}"
 SEED="${SEED:-42}"
 
-TRAIN_GPU="${TRAIN_GPU:-0}"
+TRAIN_GPU="${TRAIN_GPU:-1}"
 BASE_MODEL_NAME="$(basename "${QWEN_BASE}")"
 LOG_DIR="${OUT_DIR}/logs/${BASE_MODEL_NAME}"
 export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
