@@ -57,7 +57,6 @@ SFT_DIR="${OUT_DIR}/weights/${VERSION}/sft"
 DPO_DIR="${OUT_DIR}/weights/${VERSION}/dpo"
 
 TEST_INFER_JSONL="${SPLIT_DIR}/test_infer.jsonl"
-TEST_DPO_JSONL="${SPLIT_DIR}/test.jsonl"
 
 # Prediction files
 PRED_SFT="${EVAL_DIR}/predictions_sft_${VERSION}.jsonl"
@@ -79,6 +78,10 @@ JUDGE_BASE_URL="${JUDGE_BASE_URL:-http://localhost:8002/v1}"
 JUDGE_API_KEY="${JUDGE_API_KEY:-EMPTY}"
 JUDGE_MODEL="${JUDGE_MODEL:-Qwen3.5-27B}"
 
+# User-group evidence sources (real Amazon reviews + user->SID mapping)
+REVIEWS_JSONL="${REVIEWS_JSONL:-/home/yuanhanyang.yhy/model_hub/amazon_user/raw/step4/final_target_user_reviews_by_category/final_target_user_reviews_electronics.jsonl}"
+USER_SID_JSONL="${USER_SID_JSONL:-/home/yuanhanyang.yhy/model_hub/amazon_user/user_semantic_ids.jsonl}"
+
 export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES="${INFER_GPU}"
 
@@ -92,6 +95,8 @@ echo "  Test set: ${TEST_INFER_JSONL}"
 echo "  SFT ckpt: ${SFT_CKPT}"
 echo "  DPO ckpt: ${DPO_CKPT}"
 echo "  Judge: ${JUDGE_MODEL} @ ${JUDGE_BASE_URL}"
+echo "  Reviews: ${REVIEWS_JSONL}"
+echo "  User->SID: ${USER_SID_JSONL}"
 echo "============================================="
 echo ""
 
@@ -185,7 +190,8 @@ else
   echo "  Judge model: ${JUDGE_MODEL} @ ${JUDGE_BASE_URL}"
   python3 softprompt/eval/offline_eval.py \
     --pred-jsonl "${PRED_DPO}" \
-    --dpo-jsonl "${TEST_DPO_JSONL}" \
+    --reviews-jsonl "${REVIEWS_JSONL}" \
+    --user-sid "${USER_SID_JSONL}" \
     --output-jsonl "${EVAL_DPO}" \
     --summary-json "${SUMMARY_DPO}" \
     --openai-base-url "${JUDGE_BASE_URL}" \

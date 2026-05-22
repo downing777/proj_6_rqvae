@@ -5,31 +5,14 @@ LLM-as-judge offline evaluation for SID-conditioned title generation.
 
 输入:
   --pred-jsonl: softprompt/infer/generate_title.py 的产物, 每行含
-      {item_id, sid, context, generated_text}
-    其中 generated_text 通常是 "<prompt>...<生成的标题>", 本脚本会剥离 prompt 前缀。
+      {item_id, sid, context, generated_text, original_title}
 
-  --dpo-jsonl (可选): softprompt/dpo_title_gen.py 的产物, 每行含
-      {item_id, sid, context, title_chosen, title_rejected, ...}
-    若提供, 当 prediction.context 缺失时用此处 context 兜底; 同时把 title_chosen
-    作为参考 (仅用于产出报表, 不参与 judge 决策)。
+  --reviews-jsonl + --user-sid: Amazon 评论 + user_id_raw -> SID 映射,
+    给 judge 注入 "该 SID 用户群在本商品下的真实评论" 作为用户画像证据
+    (口径与 dpo_title_gen.py 完全一致, 复用其 stream_reviews_indexed / aggregate_reviews)
 
-评判维度 (LLM-as-judge):
-  1) personalization: 相比原标题, 新标题对当前 SID 用户群是否更个性化 (better/same/worse)
-  2) hallucination:   新标题是否引入了商品上下文不存在的属性/卖点 (none/minor/major)
-  3) fluency:         相比原标题, 新标题的中文通顺度 (better/same/worse)
-  4) overall:         综合上面三点, 新标题相对原标题 (win/tie/lose)
-
-判定 "新标题更好" 的口径 (用于胜率统计):
-  - personalization in {better}
-  - hallucination in {none, minor}
-  - fluency in {better, same}
-  - overall == win
-任一不满足则视作非胜出 (tie / lose 计入对应桶)。
-
-为消除 judge 的位置偏置, 每条样本随机决定原标题/新标题是 A 还是 B,
-然后再把 judge 的回答映射回 (original, generated)。
-
-并发/重试/usage 记录/skip-existing 的实现风格沿用 dpo_title_gen.py。
+评判维度: personalization / hallucination / fluency / overall。
+为消除位置偏置, 每条样本随机决定 original/generated 落 A 或 B, 再把 judge 回答映射回 (original, generated)。
 
 依赖: pip install openai tqdm
 """
@@ -63,6 +46,8 @@ except ImportError as e:  # pragma: no cover
     print("Error: tqdm is required. Install with: pip install tqdm", file=sys.stderr)
     raise e
 
+from softprompt.dpo_title_gen import aggregate_reviews, stream_reviews_indexed
+
 
 DEFAULT_OPENAI_BASE_URL = "http://localhost:8000/v1"
 DEFAULT_OPENAI_API_KEY = "EMPTY"
@@ -71,7 +56,7 @@ SidTuple = Tuple[int, ...]
 
 
 # --------------------------------------------------------------------------- #
-#  Data loading & cleaning
+#  Data loading
 # --------------------------------------------------------------------------- #
 
 
@@ -98,79 +83,71 @@ def to_sid_tuple(sid: Any) -> Optional[SidTuple]:
         return None
 
 
-_PROMPT_TAIL = "请为该 SID 用户群生成一个吸引点击的商品标题："
-
-
-def strip_prompt_prefix(generated_text: str, context: Optional[str]) -> str:
-    """generate_title.py 不剥离 prompt, 这里把 prompt 部分去掉, 仅保留模型续写。"""
-    if not generated_text:
-        return ""
-    text = generated_text
-    idx = text.rfind(_PROMPT_TAIL)
-    if idx >= 0:
-        text = text[idx + len(_PROMPT_TAIL):]
-    elif context:
-        ctx_idx = text.rfind(context)
-        if ctx_idx >= 0:
-            text = text[ctx_idx + len(context):]
-            tail_idx = text.find(_PROMPT_TAIL)
-            if tail_idx >= 0:
-                text = text[tail_idx + len(_PROMPT_TAIL):]
-    text = text.strip().lstrip("：:").strip()
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
-_TITLE_PATTERNS = [
-    re.compile(r"原商品标题\(英文\):\s*(.+)"),
-    re.compile(r"原商品标题:\s*(.+)"),
-    re.compile(r"商品标题:\s*(.+)"),
-    re.compile(r"Original title:\s*(.+)", re.IGNORECASE),  # 当前英文 context 格式
-]
+_ORIGINAL_TITLE_RE = re.compile(r"^\s*Original title:\s*(.+)$", re.IGNORECASE)
 
 
 def extract_original_title(context: str) -> str:
+    """Fallback: 当 prediction 行没有 original_title 字段时, 从 context 里抠 'Original title: ...' 行。"""
     if not context:
         return ""
-    for pat in _TITLE_PATTERNS:
-        for line in context.splitlines():
-            m = pat.search(line.strip())
-            if m:
-                return m.group(1).strip().strip("。.")
+    for line in context.splitlines():
+        m = _ORIGINAL_TITLE_RE.match(line)
+        if m:
+            return m.group(1).strip().strip(".")
     return ""
 
 
-_SID_LINE = re.compile(r"目标\s*SID[^:：]*[:：]\s*(\[[^\]]*\])")
-
-
-def context_user_evidence(context: str) -> str:
-    """从 dpo_title_gen 风格的 context 里抽取 '该 SID 用户群的评论证据' 段, 给 judge 用作用户画像。"""
+def context_without_original_title(context: str) -> str:
+    """剥掉 context 里的 'Original title:' 行再给 judge —— 否则 judge 一眼看到原文,
+    候选 A/B 的位置随机化形同虚设。"""
     if not context:
         return ""
-    lines = context.splitlines()
-    keep: List[str] = []
-    for line in lines:
-        s = line.strip()
-        if not s:
+    kept = [line for line in context.splitlines() if not _ORIGINAL_TITLE_RE.match(line)]
+    return "\n".join(kept).strip()
+
+
+# --------------------------------------------------------------------------- #
+#  User-group evidence (real reviews for the (item, SID) tuple)
+# --------------------------------------------------------------------------- #
+
+
+def load_user_to_sid(user_sid_jsonl: str) -> Dict[str, SidTuple]:
+    """user_semantic_ids.jsonl -> {user_id_raw: SidTuple}"""
+    out: Dict[str, SidTuple] = {}
+    for r in load_jsonl(user_sid_jsonl):
+        raw = r.get("user_id_raw")
+        rqv = r.get("rqvae_id")
+        if not raw or not isinstance(rqv, list):
             continue
-        if s.startswith("该 SID 用户群") or s.startswith("同商品另一 SID") or s.startswith("目标 SID"):
-            keep.append(s)
-    return "\n".join(keep)
+        try:
+            out[str(raw)] = tuple(int(x) for x in rqv)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
-def context_product_attrs(context: str) -> str:
-    """商品属性段 (除评论证据/SID 外的客观信息), 给 judge 判断幻觉。"""
-    if not context:
+def format_review_evidence(
+    reviews_by_asin: Any,
+    user_to_sid: Dict[str, SidTuple],
+    item_id: str,
+    sid: SidTuple,
+    max_chars: int,
+) -> str:
+    """对 (item_id, sid), 拉出映射到该 SID 的用户在该商品下的真实评论并聚合。
+    与 dpo_title_gen 同源, 保证 judge 看到的用户画像跟造数据时老师 LLM 一致。"""
+    urev = reviews_by_asin.get(item_id)
+    if not urev:
         return ""
-    out: List[str] = []
-    for line in context.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if s.startswith("该 SID 用户群") or s.startswith("同商品另一 SID") or s.startswith("目标 SID"):
-            continue
-        out.append(s)
-    return "\n".join(out)
+    u_set = {uid for uid in urev if user_to_sid.get(uid) == sid}
+    if not u_set:
+        return ""
+    ev = aggregate_reviews(urev, u_set, max_chars).strip()
+    if not ev:
+        return ""
+    return (
+        "Real reviews from this SID user group on this product "
+        "(sorted by rating, truncated):\n" + ev
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -185,21 +162,15 @@ class JudgeSample:
     context: str
     original_title: str
     generated_title: str
-    reference_chosen: Optional[str]  # 仅作报表参考, 不告知 judge
+    user_evidence: str
 
 
 def build_samples(
     pred_rows: List[Dict[str, Any]],
-    dpo_rows: List[Dict[str, Any]],
-    fallback_original_title: str = "",
+    reviews_by_asin: Any,
+    user_to_sid: Dict[str, SidTuple],
+    evidence_max_chars: int,
 ) -> List[JudgeSample]:
-    dpo_map: Dict[Tuple[str, SidTuple], Dict[str, Any]] = {}
-    for r in dpo_rows:
-        sid = to_sid_tuple(r.get("sid"))
-        iid = r.get("item_id")
-        if iid and sid:
-            dpo_map[(str(iid), sid)] = r
-
     samples: List[JudgeSample] = []
     for r in pred_rows:
         sid = to_sid_tuple(r.get("sid"))
@@ -207,27 +178,16 @@ def build_samples(
         if not iid or sid is None:
             continue
         context = r.get("context") or ""
-        dpo_row = dpo_map.get((str(iid), sid))
-        if not context and dpo_row is not None:
-            context = dpo_row.get("context") or ""
-        gen_text = r.get("generated_text") or ""
-        gen_title = strip_prompt_prefix(gen_text, context)
+        # generate_title.py 已经只写 prompt 之后的新 token, 这里直接 strip 即可
+        gen_title = (r.get("generated_text") or "").strip()
         if not gen_title:
             continue
-        # 优先读 prediction 文件里 generate_title.py 直接落的字段; 兜底再做正则解析。
-        # 这样新 predictions (含字段) / 老 predictions (只有 context) 都能 judge。
-        original = (
-            (r.get("original_title") or "").strip()
-            or extract_original_title(context)
-            or fallback_original_title
-        )
+        original = (r.get("original_title") or "").strip() or extract_original_title(context)
         if not original:
             continue
-        ref_chosen = None
-        if dpo_row is not None:
-            tc = dpo_row.get("title_chosen")
-            if isinstance(tc, str) and tc.strip():
-                ref_chosen = tc.strip()
+        user_ev = format_review_evidence(
+            reviews_by_asin, user_to_sid, str(iid), sid, evidence_max_chars
+        )
         samples.append(
             JudgeSample(
                 item_id=str(iid),
@@ -235,7 +195,7 @@ def build_samples(
                 context=context,
                 original_title=original,
                 generated_title=gen_title,
-                reference_chosen=ref_chosen,
+                user_evidence=user_ev,
             )
         )
     return samples
@@ -247,34 +207,32 @@ def build_samples(
 
 
 JUDGE_SYSTEM_PROMPT = (
-    "你是严格、谨慎的电商标题评测员。给定一个商品的客观属性、目标 SID 用户群的评论证据, "
-    "以及该商品的两个候选中文标题(标记为 A 与 B), 请按以下三个维度做对比, 然后给出综合偏好。\n"
-    "维度:\n"
-    "1) personalization: 相对另一个标题, 候选标题是否更贴合 [目标 SID 用户群] 在评论证据里"
-    "暴露出的关注点/偏好。取值: A_better / B_better / tie。\n"
-    "2) hallucination: 候选标题是否引入了 [商品客观属性] 中找不到依据的具体属性/功能/材质/数字 (如不存在的"
-    "续航时长、不存在的认证、夸大的型号差异等)。取值: A_better / B_better / tie\n"
-    "   (better 含义为该候选幻觉更少; 若两者都几乎无幻觉则 tie)。\n"
-    "3) fluency: 中文表达是否通顺自然 (语序、搭配、是否有重复字符或乱码)。"
-    "取值: A_better / B_better / tie。\n"
-    "4) overall: 综合上面三点, 给出整体偏好 (win 给更好的那个候选)。"
-    "取值: A_win / B_win / tie。\n"
-    "判罚规则: 如果一个候选包含明显的幻觉/事实错误, overall 不能判它 win。"
-    "如果一个候选有重复字符/乱码/明显不通顺, overall 不能判它 win。\n"
-    "请严格只输出一个 JSON 对象, 字段为 personalization, hallucination, fluency, overall, reason。"
-    "其中 reason 用一句话简述。不要任何额外文本。"
+    "You are a strict, careful evaluator for e-commerce product titles. "
+    "Given a product's objective info, real reviews from the target user group, "
+    "and two candidate titles (labeled A and B), compare them on the THREE dimensions below. "
+    "You do NOT need to give an overall preference — judge only the three dimensions independently.\n"
+    "Dimensions:\n"
+    "1) personalization: Which title better matches the interests / preferences of the target user group "
+    "as revealed by their reviews? Values: A_better / B_better / tie. "
+    "If user-group evidence is empty, output tie.\n"
+    "2) hallucination: Does either title introduce specific attributes / features / materials / numbers "
+    "(e.g. nonexistent battery life, fake certification, exaggerated specs) NOT supported by the product info? "
+    "Values: A_better / B_better / tie (better = fewer hallucinations; if both are essentially clean, use tie).\n"
+    "3) fluency: Is the English natural and well-formed (word order, collocations, no repeated tokens / gibberish)? "
+    "Values: A_better / B_better / tie.\n"
+    "Output STRICTLY a single JSON object with fields personalization, hallucination, fluency, reason. "
+    "reason is a one-sentence explanation. No additional text."
 )
 
 JUDGE_USER_TEMPLATE = (
-    "[商品客观属性]\n{product_attrs}\n\n"
-    "[目标 SID 用户群证据]\n{user_evidence}\n\n"
-    "[候选 A]\n{title_a}\n\n"
-    "[候选 B]\n{title_b}\n\n"
-    "请只输出 JSON: "
+    "[Product objective info]\n{product_attrs}\n\n"
+    "[Target SID user-group evidence]\n{user_evidence}\n\n"
+    "[Candidate A]\n{title_a}\n\n"
+    "[Candidate B]\n{title_b}\n\n"
+    "Output JSON only: "
     "{{\"personalization\": \"A_better|B_better|tie\", "
     "\"hallucination\": \"A_better|B_better|tie\", "
     "\"fluency\": \"A_better|B_better|tie\", "
-    "\"overall\": \"A_win|B_win|tie\", "
     "\"reason\": \"...\"}}"
 )
 
@@ -303,7 +261,7 @@ def extract_usage(resp: Any) -> Optional[Dict[str, int]]:
 
 
 def position_role(sample: JudgeSample, seed: int) -> Tuple[str, str, str]:
-    """决定原标题/生成标题各自落到 A 还是 B (位置随机化)。返回 (title_a, title_b, original_pos)。"""
+    """决定 original/generated 落 A 还是 B (位置随机化)。返回 (title_a, title_b, original_pos)。"""
     h = int(hashlib.md5(f"{sample.item_id}:{sample.sid}:{seed}".encode()).hexdigest()[:8], 16)
     if h % 2 == 0:
         return sample.original_title, sample.generated_title, "A"
@@ -311,7 +269,7 @@ def position_role(sample: JudgeSample, seed: int) -> Tuple[str, str, str]:
 
 
 def _map_two(value: str, original_pos: str) -> str:
-    """把 A_better/B_better/tie 翻译成 original_better/generated_better/tie。"""
+    """把 A_better / B_better / tie 翻译成 original_better / generated_better / tie。"""
     v = (value or "").strip().lower()
     if v not in ("a_better", "b_better", "tie"):
         return "tie"
@@ -321,34 +279,46 @@ def _map_two(value: str, original_pos: str) -> str:
     return "original_better" if chose == original_pos else "generated_better"
 
 
-def _map_overall(value: str, original_pos: str) -> str:
-    """A_win/B_win/tie -> original_win/generated_win/tie。"""
-    v = (value or "").strip().lower()
-    if v == "tie":
+_DIMS = ("personalization", "hallucination", "fluency")
+
+
+def _derive_overall(norm: Dict[str, str]) -> str:
+    """从 3 维度判断推导 overall: 票数和决定方向, 幻觉一票否决。
+    +1 generated_better / -1 original_better / 0 tie -> 求和。
+    Hallucination veto: 如果 hallucination 上 original 更好, overall 不能给 generated_win
+    (反向同理), 避免"幻觉更严重但拼了流畅/个性化反超"的可疑判定。"""
+    score = 0
+    for k in _DIMS:
+        v = norm[k]
+        if v == "generated_better":
+            score += 1
+        elif v == "original_better":
+            score -= 1
+    if norm["hallucination"] == "original_better" and score > 0:
         return "tie"
-    if v not in ("a_win", "b_win"):
+    if norm["hallucination"] == "generated_better" and score < 0:
         return "tie"
-    chose = "A" if v == "a_win" else "B"
-    return "original_win" if chose == original_pos else "generated_win"
+    if score > 0:
+        return "generated_win"
+    if score < 0:
+        return "original_win"
+    return "tie"
 
 
 def normalize_judge(raw: Dict[str, Any], original_pos: str) -> Dict[str, Any]:
-    return {
-        "personalization": _map_two(str(raw.get("personalization", "tie")), original_pos),
-        "hallucination": _map_two(str(raw.get("hallucination", "tie")), original_pos),
-        "fluency": _map_two(str(raw.get("fluency", "tie")), original_pos),
-        "overall": _map_overall(str(raw.get("overall", "tie")), original_pos),
-        "reason": str(raw.get("reason", ""))[:500],
+    norm: Dict[str, Any] = {
+        k: _map_two(str(raw.get(k, "tie")), original_pos) for k in _DIMS
     }
+    norm["reason"] = str(raw.get("reason", ""))[:500]
+    norm["overall"] = _derive_overall(norm)
+    return norm
 
 
 def is_strict_win(norm: Dict[str, Any]) -> bool:
-    return (
-        norm["personalization"] == "generated_better"
-        and norm["hallucination"] in ("generated_better", "tie")
-        and norm["fluency"] in ("generated_better", "tie")
-        and norm["overall"] == "generated_win"
-    )
+    """严格胜出: 3 个维度全部不输 (≥1 项更好, 其余至少 tie)。"""
+    if any(norm[k] == "original_better" for k in _DIMS):
+        return False
+    return any(norm[k] == "generated_better" for k in _DIMS)
 
 
 # --------------------------------------------------------------------------- #
@@ -369,8 +339,8 @@ async def call_judge_once(
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, int]]]:
     title_a, title_b, original_pos = position_role(sample, seed)
     user_msg = JUDGE_USER_TEMPLATE.format(
-        product_attrs=context_product_attrs(sample.context) or "(无)",
-        user_evidence=context_user_evidence(sample.context) or "(无)",
+        product_attrs=context_without_original_title(sample.context) or "(none)",
+        user_evidence=sample.user_evidence or "(none)",
         title_a=title_a,
         title_b=title_b,
     )
@@ -474,28 +444,47 @@ def wilson_ci(successes: int, total: int, z: float = 1.96) -> Optional[Tuple[flo
 
 
 def summarize(judgments: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """三维度 win rate + 推导出的 overall win rate, 都按 generated 视角统计。
+
+    每个维度的 win_rate = generated_better / n。
+    overall 由每条 judgment 的 _derive_overall (幻觉一票否决 + 票数和) 推出。
+    """
     n = len(judgments)
     if n == 0:
         return {"sample_count": 0}
 
-    def rate(field: str, target: str) -> float:
-        return sum(1 for j in judgments if j[field] == target) / n
-
-    overall_counts = Counter(j["overall"] for j in judgments)
-    strict_wins = sum(1 for j in judgments if is_strict_win(j))
-
+    overall_counts = Counter(j.get("overall", "tie") for j in judgments)
     overall_win = overall_counts.get("generated_win", 0)
     overall_tie = overall_counts.get("tie", 0)
     overall_lose = overall_counts.get("original_win", 0)
-
-    # 控制 tie 后的胜率 (排除 tie 后, 生成 vs 原始 的胜出比例)
     decisive = overall_win + overall_lose
     win_rate_excl_tie = (overall_win / decisive) if decisive > 0 else None
 
+    strict_wins = sum(1 for j in judgments if is_strict_win(j))
     sid_buckets = Counter(",".join(str(x) for x in j["sid"]) for j in judgments)
 
-    summary: Dict[str, Any] = {
+    per_dim: Dict[str, Dict[str, Any]] = {}
+    for dim in _DIMS:
+        gw = sum(1 for j in judgments if j.get(dim) == "generated_better")
+        tw = sum(1 for j in judgments if j.get(dim) == "tie")
+        ow = sum(1 for j in judgments if j.get(dim) == "original_better")
+        per_dim[dim] = {
+            "generated_win_rate": gw / n,
+            "tie_rate": tw / n,
+            "original_win_rate": ow / n,
+            "wilson95_generated_win_rate": wilson_ci(gw, n),
+        }
+
+    return {
         "sample_count": n,
+        # 三维度 + overall 的 generated win rate (主指标)
+        "win_rates": {
+            "personalization": per_dim["personalization"]["generated_win_rate"],
+            "hallucination": per_dim["hallucination"]["generated_win_rate"],
+            "fluency": per_dim["fluency"]["generated_win_rate"],
+            "overall": overall_win / n,
+        },
+        # overall 的完整 break-down (tie / lose / 排除 tie 后的胜率 / 置信区间)
         "overall": {
             "generated_win_rate": overall_win / n,
             "tie_rate": overall_tie / n,
@@ -503,38 +492,13 @@ def summarize(judgments: List[Dict[str, Any]]) -> Dict[str, Any]:
             "win_rate_excluding_tie": win_rate_excl_tie,
             "wilson95_generated_win_rate": wilson_ci(overall_win, n),
         },
+        # 每维度完整 break-down
+        "per_dimension": per_dim,
+        # 严格胜出: 3 维度全部不输且至少一项更好
         "strict_win_rate": strict_wins / n,
         "wilson95_strict_win_rate": wilson_ci(strict_wins, n),
-        "personalization": {
-            "generated_better": rate("personalization", "generated_better"),
-            "tie": rate("personalization", "tie"),
-            "original_better": rate("personalization", "original_better"),
-        },
-        "hallucination": {
-            "generated_better": rate("hallucination", "generated_better"),
-            "tie": rate("hallucination", "tie"),
-            "original_better": rate("hallucination", "original_better"),
-            "generated_no_worse_rate": (
-                sum(
-                    1 for j in judgments
-                    if j["hallucination"] in ("generated_better", "tie")
-                ) / n
-            ),
-        },
-        "fluency": {
-            "generated_better": rate("fluency", "generated_better"),
-            "tie": rate("fluency", "tie"),
-            "original_better": rate("fluency", "original_better"),
-            "generated_no_worse_rate": (
-                sum(
-                    1 for j in judgments
-                    if j["fluency"] in ("generated_better", "tie")
-                ) / n
-            ),
-        },
         "sid_bucket_count": len(sid_buckets),
     }
-    return summary
 
 
 # --------------------------------------------------------------------------- #
@@ -545,9 +509,11 @@ def summarize(judgments: List[Dict[str, Any]]) -> Dict[str, Any]:
 async def amain() -> int:
     ap = argparse.ArgumentParser(description="LLM-as-judge offline eval for SID title generation.")
     ap.add_argument("--pred-jsonl", type=str, required=True,
-                    help="generate_title.py 输出, 每行 {item_id, sid, context, generated_text}")
-    ap.add_argument("--dpo-jsonl", type=str, default="",
-                    help="可选, dpo_title_gen.py 输出, 用于在 prediction 缺失 context 时兜底")
+                    help="generate_title.py 产出, 每行 {item_id, sid, context, generated_text, original_title}")
+    ap.add_argument("--reviews-jsonl", type=str, required=True,
+                    help="Amazon 评论 jsonl, 每行至少含 parent_asin/user_id/rating/text")
+    ap.add_argument("--user-sid", type=str, required=True,
+                    help="user_semantic_ids.jsonl (user_id_raw + rqvae_id)")
     ap.add_argument("--output-jsonl", type=str,
                     default="softprompt/outputs/llm_judge.jsonl",
                     help="逐条 judge 结果")
@@ -574,23 +540,46 @@ async def amain() -> int:
     ap.add_argument("--no-progress", action="store_true")
     ap.add_argument("--extra-body-json", type=str, default="",
                     help='vLLM extra_body; 为空则使用 {"top_k": 1} 以贴近贪心')
+    ap.add_argument("--evidence-max-chars", type=int, default=1500,
+                    help="评论证据聚合后的最大字符数 (跟 dpo_title_gen --max-review-chars 对齐)")
     args = ap.parse_args()
 
-    if not os.path.isfile(args.pred_jsonl):
-        print(f"Error: --pred-jsonl not found: {args.pred_jsonl}", file=sys.stderr)
-        return 1
+    for label, path in [
+        ("--pred-jsonl", args.pred_jsonl),
+        ("--reviews-jsonl", args.reviews_jsonl),
+        ("--user-sid", args.user_sid),
+    ]:
+        if not os.path.isfile(path):
+            print(f"ERROR: {label} not found: {path}", file=sys.stderr)
+            return 1
 
     pred_rows = load_jsonl(args.pred_jsonl)
-    dpo_rows = load_jsonl(args.dpo_jsonl) if args.dpo_jsonl and os.path.isfile(args.dpo_jsonl) else []
-    print(f"Loaded {len(pred_rows)} predictions; {len(dpo_rows)} DPO rows for context fallback.")
+    print(f"Loaded {len(pred_rows)} predictions.")
 
-    samples = build_samples(pred_rows, dpo_rows)
+    user_to_sid = load_user_to_sid(args.user_sid)
+    print(f"Loaded user_to_sid: {len(user_to_sid)} users.")
+
+    asin_set = {str(r.get("item_id")) for r in pred_rows if r.get("item_id")}
+    print(f"Indexing reviews for {len(asin_set)} predicted items...")
+    reviews_by_asin = stream_reviews_indexed(args.reviews_jsonl, asin_set, set(user_to_sid))
+    n_with_reviews = sum(1 for asin in asin_set if reviews_by_asin.get(asin))
+    print(f"  reviews indexed for {n_with_reviews}/{len(asin_set)} items.")
+
+    samples = build_samples(
+        pred_rows,
+        reviews_by_asin=reviews_by_asin,
+        user_to_sid=user_to_sid,
+        evidence_max_chars=args.evidence_max_chars,
+    )
     if args.max_samples is not None:
         samples = samples[: args.max_samples]
     print(f"Built {len(samples)} judgable samples (have generated_title and original_title).")
+    n_with_ev = sum(1 for s in samples if s.user_evidence)
+    print(f"  with user_evidence injected: {n_with_ev}/{len(samples)}")
     if not samples:
-        print("Nothing to judge. Check that generated_text is non-empty and context contains "
-              "'原商品标题(英文): ...' line.", file=sys.stderr)
+        print("Nothing to judge. Check predictions: need non-empty generated_text and "
+              "either an `original_title` field or an 'Original title:' line in context.",
+              file=sys.stderr)
         return 1
 
     out_dir = os.path.dirname(os.path.abspath(args.output_jsonl)) or "."
@@ -643,7 +632,6 @@ async def amain() -> int:
                     "sid": list(s.sid),
                     "original_title": s.original_title,
                     "generated_title": s.generated_title,
-                    "reference_chosen": s.reference_chosen,
                     "personalization": norm["personalization"],
                     "hallucination": norm["hallucination"],
                     "fluency": norm["fluency"],
@@ -684,7 +672,7 @@ async def amain() -> int:
         if args.no_progress:
             await asyncio.gather(*[process_one(s) for s in samples])
             return
-        pbar = tqdm(total=len(samples), desc="LLM-judge", unit="条",
+        pbar = tqdm(total=len(samples), desc="LLM-judge", unit="row",
                     file=sys.stdout, mininterval=0.3)
 
         async def run_one(s: JudgeSample) -> None:
@@ -715,7 +703,8 @@ async def amain() -> int:
     }
     summary["paths"] = {
         "pred_jsonl": args.pred_jsonl,
-        "dpo_jsonl": args.dpo_jsonl,
+        "reviews_jsonl": args.reviews_jsonl,
+        "user_sid": args.user_sid,
         "output_jsonl": args.output_jsonl,
         "usage_jsonl": usage_path,
     }
@@ -730,7 +719,7 @@ def main() -> None:
     try:
         raise SystemExit(asyncio.run(amain()))
     except KeyboardInterrupt:
-        print("Interrupted. 已写入的 judge 行已保留; 可加 --skip-existing 续跑。", file=sys.stderr)
+        print("Interrupted. 已写入的 judge 行已保留; 加 --skip-existing 续跑。", file=sys.stderr)
         raise SystemExit(130)
 
 
