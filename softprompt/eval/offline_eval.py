@@ -11,8 +11,14 @@ LLM-as-judge offline evaluation for SID-conditioned title generation.
     给 judge 注入 "该 SID 用户群在本商品下的真实评论" 作为用户画像证据
     (口径与 dpo_title_gen.py 完全一致, 复用其 stream_reviews_indexed / aggregate_reviews)
 
-评判维度: personalization / hallucination / fluency / overall。
-为消除位置偏置, 每条样本随机决定 original/generated 落 A 或 B, 再把 judge 回答映射回 (original, generated)。
+评判方式 (每条样本两次 judge):
+  Pass 1 (比较): personalization / fluency 两个维度, 双盲对比 original vs generated。
+    每条随机决定 original/generated 落 A 或 B, 再把 judge 回答映射回
+    (original_better / generated_better / tie)。汇总成 generated 视角的胜率。
+  Pass 2 (幻觉检测): 给 judge 商品客观信息 + 原始标题 (视为无幻觉的 ground truth)
+    + 生成标题, 让其判断生成标题是否引入了未被支持的具体声明 (属性/数字/材质/认证等),
+    输出 has_hallucination (bool) + hallucinated_claims (list[str])。
+    汇总成 hallucination rate (有幻觉的生成标题占比) —— 不是胜率。
 
 依赖: pip install openai tqdm
 """
@@ -32,7 +38,7 @@ import time
 import traceback
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 try:
     from openai import APIConnectionError, APIError, APITimeoutError, AsyncOpenAI
@@ -98,8 +104,8 @@ def extract_original_title(context: str) -> str:
 
 
 def context_without_original_title(context: str) -> str:
-    """剥掉 context 里的 'Original title:' 行再给 judge —— 否则 judge 一眼看到原文,
-    候选 A/B 的位置随机化形同虚设。"""
+    """剥掉 context 里的 'Original title:' 行 —— compare judge 不能直接看到原文,
+    幻觉 judge 也避免重复 (我们已经把原始标题作为独立字段单独给它)。"""
     if not context:
         return ""
     kept = [line for line in context.splitlines() if not _ORIGINAL_TITLE_RE.match(line)]
@@ -178,7 +184,6 @@ def build_samples(
         if not iid or sid is None:
             continue
         context = r.get("context") or ""
-        # generate_title.py 已经只写 prompt 之后的新 token, 这里直接 strip 即可
         gen_title = (r.get("generated_text") or "").strip()
         if not gen_title:
             continue
@@ -202,39 +207,72 @@ def build_samples(
 
 
 # --------------------------------------------------------------------------- #
-#  LLM judge
+#  LLM judge prompts
 # --------------------------------------------------------------------------- #
 
 
-JUDGE_SYSTEM_PROMPT = (
+JUDGE_COMPARE_SYSTEM_PROMPT = (
     "You are a strict, careful evaluator for e-commerce product titles. "
     "Given a product's objective info, real reviews from the target user group, "
-    "and two candidate titles (labeled A and B), compare them on the THREE dimensions below. "
-    "You do NOT need to give an overall preference — judge only the three dimensions independently.\n"
+    "and two candidate titles (labeled A and B), compare them on the TWO dimensions below. "
+    "Judge each dimension independently — do NOT give an overall preference.\n"
     "Dimensions:\n"
     "1) personalization: Which title better matches the interests / preferences of the target user group "
-    "as revealed by their reviews? Values: A_better / B_better / tie. "
-    "If user-group evidence is empty, output tie.\n"
-    "2) hallucination: Does either title introduce specific attributes / features / materials / numbers "
-    "(e.g. nonexistent battery life, fake certification, exaggerated specs) NOT supported by the product info? "
-    "Values: A_better / B_better / tie (better = fewer hallucinations; if both are essentially clean, use tie).\n"
-    "3) fluency: Is the English natural and well-formed (word order, collocations, no repeated tokens / gibberish)? "
-    "Values: A_better / B_better / tie.\n"
-    "Output STRICTLY a single JSON object with fields personalization, hallucination, fluency, reason. "
+    "as revealed by their reviews (highlights features they care about, uses framing that resonates)? "
+    "Values: A_better / B_better / tie. If user-group evidence is empty, output tie.\n"
+    "2) fluency: Is the English natural and well-formed (word order, collocations, no repeated tokens / "
+    "gibberish / awkward concatenation)? Values: A_better / B_better / tie.\n"
+    "Do NOT judge factual accuracy / hallucination here — that is evaluated in a separate pass.\n"
+    "Output STRICTLY a single JSON object with fields personalization, fluency, reason. "
     "reason is a one-sentence explanation. No additional text."
 )
 
-JUDGE_USER_TEMPLATE = (
+JUDGE_COMPARE_USER_TEMPLATE = (
     "[Product objective info]\n{product_attrs}\n\n"
     "[Target SID user-group evidence]\n{user_evidence}\n\n"
     "[Candidate A]\n{title_a}\n\n"
     "[Candidate B]\n{title_b}\n\n"
     "Output JSON only: "
     "{{\"personalization\": \"A_better|B_better|tie\", "
-    "\"hallucination\": \"A_better|B_better|tie\", "
     "\"fluency\": \"A_better|B_better|tie\", "
     "\"reason\": \"...\"}}"
 )
+
+
+JUDGE_HALLU_SYSTEM_PROMPT = (
+    "You are a strict, careful fact-checker for e-commerce product titles. "
+    "You are given (1) a product's objective info, (2) the ORIGINAL ground-truth title "
+    "(authoritative, treated as containing no hallucinations), and (3) a NEW generated title to check.\n"
+    "Your task: decide whether the NEW title introduces any SPECIFIC, VERIFIABLE claim "
+    "(attribute / feature / material / number / size / capacity / certification / brand / model / "
+    "compatibility / ingredient) that is NOT supported by either the product info or the original title.\n"
+    "Rules:\n"
+    "- Subjective adjectives ('stylish', 'comfortable', 'premium-feeling', 'great for ...') are NOT hallucinations.\n"
+    "- Reordering, paraphrasing, dropping or shortening information is NOT a hallucination.\n"
+    "- Re-using or rephrasing claims already present in the original title or product info is NOT a hallucination.\n"
+    "- Adding a specific numeric spec (e.g. '20-hour battery', '4K'), material ('genuine leather'), "
+    "certification ('FDA-approved'), brand, model number, or concrete feature not supported by either "
+    "the original title or the product info IS a hallucination.\n"
+    "- If unsure whether a claim is supported, treat it as NOT a hallucination (be conservative).\n"
+    "Output STRICTLY a single JSON object with fields has_hallucination (true|false), "
+    "hallucinated_claims (array of short strings quoting the unsupported claims; empty array if none), "
+    "reason (one-sentence explanation). No additional text."
+)
+
+JUDGE_HALLU_USER_TEMPLATE = (
+    "[Product objective info]\n{product_attrs}\n\n"
+    "[Original title (ground truth, no hallucination)]\n{original_title}\n\n"
+    "[New generated title to check]\n{generated_title}\n\n"
+    "Output JSON only: "
+    "{{\"has_hallucination\": true|false, "
+    "\"hallucinated_claims\": [\"...\"], "
+    "\"reason\": \"...\"}}"
+)
+
+
+# --------------------------------------------------------------------------- #
+#  Response parsing / normalization
+# --------------------------------------------------------------------------- #
 
 
 def parse_json_object(text: str) -> Dict[str, Any]:
@@ -279,76 +317,78 @@ def _map_two(value: str, original_pos: str) -> str:
     return "original_better" if chose == original_pos else "generated_better"
 
 
-_DIMS = ("personalization", "hallucination", "fluency")
+def _to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "yes", "1", "y", "t"):
+            return True
+    return False
 
 
-def _derive_overall(norm: Dict[str, str]) -> str:
-    """从 3 维度判断推导 overall: 票数和决定方向, 幻觉一票否决。
-    +1 generated_better / -1 original_better / 0 tie -> 求和。
-    Hallucination veto: 如果 hallucination 上 original 更好, overall 不能给 generated_win
-    (反向同理), 避免"幻觉更严重但拼了流畅/个性化反超"的可疑判定。"""
-    score = 0
-    for k in _DIMS:
-        v = norm[k]
-        if v == "generated_better":
-            score += 1
-        elif v == "original_better":
-            score -= 1
-    if norm["hallucination"] == "original_better" and score > 0:
-        return "tie"
-    if norm["hallucination"] == "generated_better" and score < 0:
-        return "tie"
-    if score > 0:
-        return "generated_win"
-    if score < 0:
-        return "original_win"
-    return "tie"
+_COMPARE_DIMS: Tuple[str, ...] = ("personalization", "fluency")
 
 
-def normalize_judge(raw: Dict[str, Any], original_pos: str) -> Dict[str, Any]:
-    norm: Dict[str, Any] = {
-        k: _map_two(str(raw.get(k, "tie")), original_pos) for k in _DIMS
+def normalize_compare(raw: Dict[str, Any], original_pos: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        k: _map_two(str(raw.get(k, "tie")), original_pos) for k in _COMPARE_DIMS
     }
-    norm["reason"] = str(raw.get("reason", ""))[:500]
-    norm["overall"] = _derive_overall(norm)
-    return norm
+    out["reason"] = str(raw.get("reason", ""))[:500]
+    return out
 
 
-def is_strict_win(norm: Dict[str, Any]) -> bool:
-    """严格胜出: 3 个维度全部不输 (≥1 项更好, 其余至少 tie)。"""
-    if any(norm[k] == "original_better" for k in _DIMS):
+def normalize_hallucination(raw: Dict[str, Any]) -> Dict[str, Any]:
+    claims_raw = raw.get("hallucinated_claims", [])
+    if isinstance(claims_raw, list):
+        claims = [str(c)[:200] for c in claims_raw if c]
+    elif isinstance(claims_raw, str):
+        claims = [claims_raw[:200]] if claims_raw.strip() else []
+    else:
+        claims = []
+    has = _to_bool(raw.get("has_hallucination", False))
+    # 若声称无幻觉但列出了 claims, 以列表为准 (避免模型出尔反尔)
+    if claims and not has:
+        has = True
+    return {
+        "has_hallucination": has,
+        "hallucinated_claims": claims,
+        "reason": str(raw.get("reason", ""))[:500],
+    }
+
+
+def is_strict_win(row: Dict[str, Any]) -> bool:
+    """严格胜出: 生成标题无幻觉 + personalization/fluency 全部不输 + 至少一项更好。"""
+    if row.get("has_hallucination"):
         return False
-    return any(norm[k] == "generated_better" for k in _DIMS)
+    if any(row.get(k) == "original_better" for k in _COMPARE_DIMS):
+        return False
+    return any(row.get(k) == "generated_better" for k in _COMPARE_DIMS)
 
 
 # --------------------------------------------------------------------------- #
-#  Async pipeline
+#  LLM judge calls
 # --------------------------------------------------------------------------- #
 
 
-async def call_judge_once(
+async def _chat_json(
     client: AsyncOpenAI,
     model: str,
-    sample: JudgeSample,
-    seed: int,
+    system_prompt: str,
+    user_prompt: str,
     max_tokens: int,
     temperature: float,
     top_p: float,
     request_timeout: float,
     extra_body: Optional[Dict[str, Any]],
-) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, int]]]:
-    title_a, title_b, original_pos = position_role(sample, seed)
-    user_msg = JUDGE_USER_TEMPLATE.format(
-        product_attrs=context_without_original_title(sample.context) or "(none)",
-        user_evidence=sample.user_evidence or "(none)",
-        title_a=title_a,
-        title_b=title_b,
-    )
+) -> Tuple[Dict[str, Any], Optional[Dict[str, int]]]:
     kwargs: Dict[str, Any] = {
         "model": model,
         "messages": [
-            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -361,13 +401,29 @@ async def call_judge_once(
     raw = (resp.choices[0].message.content or "").strip()
     if not raw:
         raise ValueError("Empty judge response")
-    parsed = parse_json_object(raw)
-    norm = normalize_judge(parsed, original_pos)
-    meta = {"original_pos": original_pos, "raw_judge": parsed}
-    return norm, meta, extract_usage(resp)
+    return parse_json_object(raw), extract_usage(resp)
 
 
-async def call_judge_with_retry(
+async def _with_retry(
+    fn: Callable[[], Awaitable[Any]],
+    max_retries: int,
+    base_delay: float,
+) -> Any:
+    last: Optional[Exception] = None
+    for attempt in range(max_retries + 1):
+        try:
+            return await fn()
+        except (APIError, APIConnectionError, APITimeoutError, json.JSONDecodeError, ValueError) as e:
+            last = e
+            if attempt >= max_retries:
+                break
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 0.3 * base_delay)
+            await asyncio.sleep(delay)
+    assert last is not None
+    raise last
+
+
+async def judge_compare(
     client: AsyncOpenAI,
     model: str,
     sample: JudgeSample,
@@ -380,22 +436,54 @@ async def call_judge_with_retry(
     base_delay: float,
     extra_body: Optional[Dict[str, Any]],
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, int]]]:
-    last: Optional[Exception] = None
-    for attempt in range(max_retries + 1):
-        try:
-            return await call_judge_once(
-                client, model, sample, seed,
-                max_tokens, temperature, top_p,
-                request_timeout, extra_body,
-            )
-        except (APIError, APIConnectionError, APITimeoutError, json.JSONDecodeError, ValueError) as e:
-            last = e
-            if attempt >= max_retries:
-                break
-            delay = base_delay * (2 ** attempt) + random.uniform(0, 0.3 * base_delay)
-            await asyncio.sleep(delay)
-    assert last is not None
-    raise last
+    title_a, title_b, original_pos = position_role(sample, seed)
+    user_msg = JUDGE_COMPARE_USER_TEMPLATE.format(
+        product_attrs=context_without_original_title(sample.context) or "(none)",
+        user_evidence=sample.user_evidence or "(none)",
+        title_a=title_a,
+        title_b=title_b,
+    )
+
+    async def _do() -> Tuple[Dict[str, Any], Optional[Dict[str, int]]]:
+        return await _chat_json(
+            client, model, JUDGE_COMPARE_SYSTEM_PROMPT, user_msg,
+            max_tokens, temperature, top_p, request_timeout, extra_body,
+        )
+
+    parsed, usage = await _with_retry(_do, max_retries, base_delay)
+    norm = normalize_compare(parsed, original_pos)
+    meta = {"original_pos": original_pos, "raw_judge": parsed}
+    return norm, meta, usage
+
+
+async def judge_hallucination(
+    client: AsyncOpenAI,
+    model: str,
+    sample: JudgeSample,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    request_timeout: float,
+    max_retries: int,
+    base_delay: float,
+    extra_body: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, int]]]:
+    user_msg = JUDGE_HALLU_USER_TEMPLATE.format(
+        product_attrs=context_without_original_title(sample.context) or "(none)",
+        original_title=sample.original_title,
+        generated_title=sample.generated_title,
+    )
+
+    async def _do() -> Tuple[Dict[str, Any], Optional[Dict[str, int]]]:
+        return await _chat_json(
+            client, model, JUDGE_HALLU_SYSTEM_PROMPT, user_msg,
+            max_tokens, temperature, top_p, request_timeout, extra_body,
+        )
+
+    parsed, usage = await _with_retry(_do, max_retries, base_delay)
+    norm = normalize_hallucination(parsed)
+    meta = {"raw_judge": parsed}
+    return norm, meta, usage
 
 
 def judge_key(item_id: str, sid: SidTuple) -> str:
@@ -444,27 +532,14 @@ def wilson_ci(successes: int, total: int, z: float = 1.96) -> Optional[Tuple[flo
 
 
 def summarize(judgments: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """三维度 win rate + 推导出的 overall win rate, 都按 generated 视角统计。
-
-    每个维度的 win_rate = generated_better / n。
-    overall 由每条 judgment 的 _derive_overall (幻觉一票否决 + 票数和) 推出。
-    """
+    """personalization / fluency 仍按 generated 视角统计胜率;
+    hallucination 单独按 generated 标题的幻觉发生率统计 (非胜率)。"""
     n = len(judgments)
     if n == 0:
         return {"sample_count": 0}
 
-    overall_counts = Counter(j.get("overall", "tie") for j in judgments)
-    overall_win = overall_counts.get("generated_win", 0)
-    overall_tie = overall_counts.get("tie", 0)
-    overall_lose = overall_counts.get("original_win", 0)
-    decisive = overall_win + overall_lose
-    win_rate_excl_tie = (overall_win / decisive) if decisive > 0 else None
-
-    strict_wins = sum(1 for j in judgments if is_strict_win(j))
-    sid_buckets = Counter(",".join(str(x) for x in j["sid"]) for j in judgments)
-
     per_dim: Dict[str, Dict[str, Any]] = {}
-    for dim in _DIMS:
+    for dim in _COMPARE_DIMS:
         gw = sum(1 for j in judgments if j.get(dim) == "generated_better")
         tw = sum(1 for j in judgments if j.get(dim) == "tie")
         ow = sum(1 for j in judgments if j.get(dim) == "original_better")
@@ -475,26 +550,30 @@ def summarize(judgments: List[Dict[str, Any]]) -> Dict[str, Any]:
             "wilson95_generated_win_rate": wilson_ci(gw, n),
         }
 
+    hallu_checked = sum(1 for j in judgments if "has_hallucination" in j)
+    hallu_count = sum(1 for j in judgments if j.get("has_hallucination"))
+    hallu_rate = (hallu_count / hallu_checked) if hallu_checked > 0 else None
+    hallu_ci = wilson_ci(hallu_count, hallu_checked) if hallu_checked > 0 else None
+
+    strict_wins = sum(1 for j in judgments if is_strict_win(j))
+    sid_buckets = Counter(",".join(str(x) for x in j["sid"]) for j in judgments)
+
     return {
         "sample_count": n,
-        # 三维度 + overall 的 generated win rate (主指标)
+        # generated 视角的胜率, 仅 personalization + fluency 两个维度
         "win_rates": {
             "personalization": per_dim["personalization"]["generated_win_rate"],
-            "hallucination": per_dim["hallucination"]["generated_win_rate"],
             "fluency": per_dim["fluency"]["generated_win_rate"],
-            "overall": overall_win / n,
         },
-        # overall 的完整 break-down (tie / lose / 排除 tie 后的胜率 / 置信区间)
-        "overall": {
-            "generated_win_rate": overall_win / n,
-            "tie_rate": overall_tie / n,
-            "original_win_rate": overall_lose / n,
-            "win_rate_excluding_tie": win_rate_excl_tie,
-            "wilson95_generated_win_rate": wilson_ci(overall_win, n),
-        },
-        # 每维度完整 break-down
         "per_dimension": per_dim,
-        # 严格胜出: 3 维度全部不输且至少一项更好
+        # 幻觉率: 生成标题中包含未支持声明的比例 (非胜率)
+        "hallucination": {
+            "checked": hallu_checked,
+            "hallucination_count": hallu_count,
+            "hallucination_rate": hallu_rate,
+            "wilson95_hallucination_rate": hallu_ci,
+        },
+        # 严格胜出: 无幻觉 + personalization/fluency 全部不输 + 至少一项更好
         "strict_win_rate": strict_wins / n,
         "wilson95_strict_win_rate": wilson_ci(strict_wins, n),
         "sid_bucket_count": len(sid_buckets),
@@ -529,7 +608,9 @@ async def amain() -> int:
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top-p", type=float, default=1.0)
-    ap.add_argument("--max-concurrency", type=int, default=4)
+    ap.add_argument("--max-concurrency", type=int, default=4,
+                    help="并发处理的样本数; 每条样本会并发发起 2 次 judge 请求, "
+                         "因此对 vLLM 的实际并发可达 2x。")
     ap.add_argument("--max-retries", type=int, default=4)
     ap.add_argument("--retry-base-delay", type=float, default=1.0)
     ap.add_argument("--request-timeout", type=float, default=180.0)
@@ -620,48 +701,62 @@ async def amain() -> int:
             return
         async with sem:
             try:
-                norm, meta, usage = await call_judge_with_retry(
+                # 两个 judge pass 并发: compare (personalization+fluency) 与 幻觉检测
+                cmp_task = judge_compare(
                     client=client, model=args.model, sample=s, seed=args.seed,
                     max_tokens=args.max_tokens, temperature=args.temperature,
                     top_p=args.top_p, request_timeout=args.request_timeout,
                     max_retries=args.max_retries, base_delay=args.retry_base_delay,
                     extra_body=extra_body,
                 )
-                row = {
+                hal_task = judge_hallucination(
+                    client=client, model=args.model, sample=s,
+                    max_tokens=args.max_tokens, temperature=args.temperature,
+                    top_p=args.top_p, request_timeout=args.request_timeout,
+                    max_retries=args.max_retries, base_delay=args.retry_base_delay,
+                    extra_body=extra_body,
+                )
+                (cmp_norm, cmp_meta, cmp_usage), (hal_norm, hal_meta, hal_usage) = \
+                    await asyncio.gather(cmp_task, hal_task)
+                row: Dict[str, Any] = {
                     "item_id": s.item_id,
                     "sid": list(s.sid),
                     "original_title": s.original_title,
                     "generated_title": s.generated_title,
-                    "personalization": norm["personalization"],
-                    "hallucination": norm["hallucination"],
-                    "fluency": norm["fluency"],
-                    "overall": norm["overall"],
-                    "strict_win": is_strict_win(norm),
-                    "reason": norm["reason"],
-                    "judge_meta": {"original_pos": meta["original_pos"]},
+                    "personalization": cmp_norm["personalization"],
+                    "fluency": cmp_norm["fluency"],
+                    "has_hallucination": hal_norm["has_hallucination"],
+                    "hallucinated_claims": hal_norm["hallucinated_claims"],
+                    "reason_compare": cmp_norm["reason"],
+                    "reason_hallucination": hal_norm["reason"],
+                    "judge_meta": {"original_pos": cmp_meta["original_pos"]},
                 }
+                row["strict_win"] = is_strict_win(row)
                 async with file_lock:
                     with open(args.output_jsonl, "a", encoding="utf-8") as f:
                         f.write(json.dumps(row, ensure_ascii=False) + "\n")
                         f.flush()
                     existing.add(k)
-                    urec = {
-                        "ts": time.time(),
-                        "item_id": s.item_id,
-                        "sid": list(s.sid),
-                        "model": args.model,
-                        "usage": usage,
-                    }
                     with open(usage_path, "a", encoding="utf-8") as uf:
-                        uf.write(json.dumps(urec, ensure_ascii=False) + "\n")
+                        for stage, usage in (("compare", cmp_usage), ("hallucination", hal_usage)):
+                            urec = {
+                                "ts": time.time(),
+                                "item_id": s.item_id,
+                                "sid": list(s.sid),
+                                "model": args.model,
+                                "stage": stage,
+                                "usage": usage,
+                            }
+                            uf.write(json.dumps(urec, ensure_ascii=False) + "\n")
                         uf.flush()
                 async with stats_lock:
                     stats["ok"] += 1
-                    if usage:
-                        stats["requests_with_usage"] += 1
-                        stats["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
-                        stats["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
-                        stats["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
+                    for usage in (cmp_usage, hal_usage):
+                        if usage:
+                            stats["requests_with_usage"] += 1
+                            stats["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
+                            stats["completion_tokens"] += int(usage.get("completion_tokens", 0) or 0)
+                            stats["total_tokens"] += int(usage.get("total_tokens", 0) or 0)
             except Exception:
                 print(f"[ERROR] item={s.item_id} sid={s.sid}:\n{traceback.format_exc()}",
                       file=sys.stderr)
@@ -700,6 +795,7 @@ async def amain() -> int:
         "sum_completion_tokens": stats["completion_tokens"],
         "sum_total_tokens": stats["total_tokens"],
         "judge_model": args.model,
+        "calls_per_sample": 2,
     }
     summary["paths"] = {
         "pred_jsonl": args.pred_jsonl,
