@@ -25,7 +25,7 @@ QWEN_BASE="${QWEN_BASE:-/home/yuanhanyang.yhy/model_hub/Qwen3.5-9B}"
 OUT_DIR="${OUT_DIR:-/home/yuanhanyang.yhy/project_6_outputs}"
 
 # ---- 版本标识: 必须与 run_train.sh 中的 VERSION 一致, 用于定位权重和区分 eval 输出 ----
-VERSION="${VERSION:-sft_chosen_dpo}"
+VERSION="${VERSION:-sft_dpo_farsid_11}"
 
 # ---- Auto-nohup: 直接 bash run_eval.sh 即可后台运行 ----
 if [[ -z "${_EVAL_NOHUP_WRAPPER:-}" ]]; then
@@ -70,11 +70,11 @@ DPO_CKPT="${DPO_DIR}/sid_dpo.pt"
 INFER_GPU="${INFER_GPU:-0}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-48}"
 TEMPERATURE="${TEMPERATURE:-0.7}"
-EVAL_SAMPLES="${EVAL_SAMPLES:-200}"
+EVAL_SAMPLES="${EVAL_SAMPLES:-500}"
 SEED="${SEED:-42}"
 
 # LLM judge settings
-JUDGE_BASE_URL="${JUDGE_BASE_URL:-http://localhost:8002/v1}"
+JUDGE_BASE_URL="${JUDGE_BASE_URL:-http://localhost:8003/v1}"
 JUDGE_API_KEY="${JUDGE_API_KEY:-EMPTY}"
 JUDGE_MODEL="${JUDGE_MODEL:-Qwen3.5-27B}"
 
@@ -132,7 +132,7 @@ else
 fi
 echo ""
 
-# Show SFT samples (visual inspection only, no judge)
+# Show SFT samples
 if [[ -f "${PRED_SFT}" ]]; then
   echo "  SFT Sample Outputs (first 10):"
   echo "  ────────────────────────────────────────"
@@ -147,14 +147,40 @@ for i, line in enumerate(sys.stdin, 1):
     print(f'      => {title}')
 " 2>/dev/null || head -10 "${PRED_SFT}"
   echo "  ────────────────────────────────────────"
-  echo "  (SFT: visual inspection only, no LLM judge)"
 fi
 echo ""
 
 # ======================================================================
-# Step 2: DPO Prediction (generate if not exist)
+# Step 2: LLM-as-judge evaluation (SFT)
 # ======================================================================
-echo "---- [2/3] DPO Prediction ----"
+echo "---- [2/4] LLM-as-Judge (SFT vs Original title) ----"
+if [[ ! -f "${PRED_SFT}" ]]; then
+  echo "  SKIPPED: SFT predictions not available."
+  EVAL_SFT="(not generated)"
+else
+  EVAL_SFT="${EVAL_DIR}/eval_results_sft_${VERSION}.jsonl"
+  SUMMARY_SFT="${EVAL_DIR}/eval_summary_sft_${VERSION}.json"
+  echo "  Running LLM judge on SFT predictions..."
+  echo "  Judge model: ${JUDGE_MODEL} @ ${JUDGE_BASE_URL}"
+  python3 softprompt/eval/offline_eval.py \
+    --pred-jsonl "${PRED_SFT}" \
+    --reviews-jsonl "${REVIEWS_JSONL}" \
+    --user-sid "${USER_SID_JSONL}" \
+    --output-jsonl "${EVAL_SFT}" \
+    --summary-json "${SUMMARY_SFT}" \
+    --openai-base-url "${JUDGE_BASE_URL}" \
+    --openai-api-key "${JUDGE_API_KEY}" \
+    --model "${JUDGE_MODEL}" \
+    --max-concurrency 8 \
+    --extra-body-json '{"top_k": 1, "chat_template_kwargs": {"enable_thinking": false}}'
+  echo "  Done!"
+fi
+echo ""
+
+# ======================================================================
+# Step 3: DPO Prediction (generate if not exist)
+# ======================================================================
+echo "---- [3/4] DPO Prediction ----"
 if [[ -f "${PRED_DPO}" ]]; then
   echo "  Found existing: ${PRED_DPO} ($(wc -l < "${PRED_DPO}") lines)"
   echo "  Skipping generation. Delete the file to regenerate."
@@ -179,7 +205,7 @@ echo ""
 # ======================================================================
 # Step 3: LLM-as-judge evaluation (DPO only)
 # ======================================================================
-echo "---- [3/3] LLM-as-Judge (DPO only) ----"
+echo "---- [4/4] LLM-as-Judge (DPO vs Original title) ----"
 if [[ ! -f "${PRED_DPO}" ]]; then
   echo "  SKIPPED: DPO predictions not available."
   EVAL_DPO="(not generated)"
@@ -207,12 +233,27 @@ echo "============================================="
 echo "  Evaluation Complete"
 echo "============================================="
 echo "  SFT predictions: ${PRED_SFT}"
-echo "    (visual inspection only — no LLM judge)"
+echo "  SFT eval results: ${EVAL_SFT:-N/A}"
 echo "  DPO predictions: ${PRED_DPO}"
 echo "  DPO eval results: ${EVAL_DPO}"
+if [[ -f "${EVAL_DIR}/eval_summary_sft_${VERSION}.json" ]]; then
+  echo ""
+  echo "  SFT Summary (vs Original title):"
+  python3 -c "
+import json
+with open('${EVAL_DIR}/eval_summary_sft_${VERSION}.json') as f:
+    s = json.load(f)
+o = s.get('overall', {})
+print(f'    Samples: {s.get(\"sample_count\", 0)}')
+print(f'    Generated win: {o.get(\"generated_win_rate\", 0):.1%}')
+print(f'    Tie: {o.get(\"tie_rate\", 0):.1%}')
+print(f'    Original win: {o.get(\"original_win_rate\", 0):.1%}')
+print(f'    Strict win rate: {s.get(\"strict_win_rate\", 0):.1%}')
+" 2>/dev/null || echo "    (see ${EVAL_DIR}/eval_summary_sft_${VERSION}.json)"
+fi
 if [[ -f "${EVAL_DIR}/eval_summary_dpo_${VERSION}.json" ]]; then
   echo ""
-  echo "  DPO Summary:"
+  echo "  DPO Summary (vs Original title):"
   python3 -c "
 import json
 with open('${EVAL_DIR}/eval_summary_dpo_${VERSION}.json') as f:
@@ -226,5 +267,5 @@ print(f'    Strict win rate: {s.get(\"strict_win_rate\", 0):.1%}')
 " 2>/dev/null || echo "    (see ${EVAL_DIR}/eval_summary_dpo_${VERSION}.json)"
 fi
 echo ""
-echo "  To view samples: head -5 ${PRED_DPO}"
-echo "  To view judge:   head -5 ${EVAL_DPO}"
+echo "  To view SFT judge: head -5 ${EVAL_SFT:-}"
+echo "  To view DPO judge: head -5 ${EVAL_DPO}"

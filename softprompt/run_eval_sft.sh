@@ -153,9 +153,13 @@ echo ""
 # 跟 run_eval.sh 评 DPO 用的是同一套 judge 口径, 结果之间可以横向对比。
 echo "---- [2/2] LLM-as-Judge (SFT vs Original title) ----"
 echo "  Judge model: ${JUDGE_MODEL} @ ${JUDGE_BASE_URL}"
+REVIEWS_JSONL="${REVIEWS_JSONL:-/home/yuanhanyang.yhy/model_hub/amazon_user/raw/step4/final_target_user_reviews_by_category/final_target_user_reviews_electronics.jsonl}"
+USER_SID_JSONL="${USER_SID_JSONL:-/home/yuanhanyang.yhy/model_hub/amazon_user/user_semantic_ids.jsonl}"
+
 python3 softprompt/eval/offline_eval.py \
   --pred-jsonl "${PRED_SFT}" \
-  --dpo-jsonl "${TEST_DPO_JSONL}" \
+  --reviews-jsonl "${REVIEWS_JSONL}" \
+  --user-sid "${USER_SID_JSONL}" \
   --output-jsonl "${EVAL_SFT}" \
   --summary-json "${SUMMARY_SFT}" \
   --openai-base-url "${JUDGE_BASE_URL}" \

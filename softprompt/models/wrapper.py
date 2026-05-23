@@ -136,7 +136,16 @@ class SidConditionedCausalLM(nn.Module):
         return generated
 
 
+def _patch_kernels_trust():
+    """Allow FP8 kernels to load without Hub connectivity check."""
+    try:
+        import kernels.utils as _ku
+        _ku._check_trust_remote_code = lambda repo_id, trust: None
+    except ImportError:
+        pass
+
 def build_sid_model(load_config: SidModelLoadConfig, device: str) -> SidConditionedCausalLM:
+    _patch_kernels_trust()
     base_model = AutoModelForCausalLM.from_pretrained(
         load_config.base_model_name_or_path,
         torch_dtype=torch.bfloat16,

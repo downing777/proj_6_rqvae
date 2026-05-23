@@ -18,12 +18,12 @@ eval "$(conda shell.bash hook)"
 conda activate softprompt
 
 # ---- 版本标识: 用于区分不同实验, 会作为后缀附加到 log/weight 文件名上 ----
-VERSION="${VERSION:-sft_dpo_ref02}"
+VERSION="${VERSION:-instruct30b_farsid_11}"
+QWEN_BASE="${QWEN_BASE:-/home/yuanhanyang.yhy/model_hub/Qwen3-30B-A3B-Instruct-2507-FP8}"
 
 # ---- Auto-nohup: 如果不是被 nohup 调用的，则自动用 nohup 重启自己 ----
 if [[ -z "${_TRAIN_NOHUP_WRAPPER:-}" ]]; then
   export _TRAIN_NOHUP_WRAPPER=1
-  QWEN_BASE="${QWEN_BASE:-/home/yuanhanyang.yhy/model_hub/Qwen3.5-9B}"
   _BASE_MODEL_NAME="$(basename "${QWEN_BASE}")"
   _LOG_DIR="/home/yuanhanyang.yhy/project_6_outputs/logs/${_BASE_MODEL_NAME}"
   mkdir -p "${_LOG_DIR}"
@@ -48,7 +48,6 @@ if [[ -z "${_TRAIN_NOHUP_WRAPPER:-}" ]]; then
   exit 0
 fi
 
-QWEN_BASE="${QWEN_BASE:-/home/yuanhanyang.yhy/model_hub/Qwen3.5-9B}"
 DPO_JSONL="${DPO_JSONL:-/home/yuanhanyang.yhy/project_6_outputs/data/dpo_electronics_generated_Qwen3.5-27B.jsonl}"
 ITEM_JSONL="${ITEM_JSONL:-/home/yuanhanyang.yhy/model_hub/amazon_user/raw/step4/final_filtered_item_meta_electronics.jsonl}"
 OUT_DIR="${OUT_DIR:-/home/yuanhanyang.yhy/project_6_outputs}"
