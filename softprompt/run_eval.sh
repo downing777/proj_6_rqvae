@@ -237,35 +237,44 @@ echo "  SFT predictions: ${PRED_SFT}"
 echo "  SFT eval results: ${EVAL_SFT:-N/A}"
 echo "  DPO predictions: ${PRED_DPO}"
 echo "  DPO eval results: ${EVAL_DPO}"
+# Pretty-print summary 的字段对齐 offline_eval.py 当前 schema:
+#   - personalization: A/B 盲比, 报 generated_better/tie/original_better 三个比例
+#   - fluency: 单向 not-worse 检查, 报 not-worse 比例 (越高越好)
+#   - hallucination: 单向幻觉检测, 报幻觉率 (越低越好)
+#   - strict_win: 无幻觉 + 流畅没退化 + personalization 上 generated 更好
+_print_summary() {
+  local path="$1"
+  python3 - "${path}" 2>/dev/null <<'PY' || echo "    (failed to parse; see ${path})"
+import sys, json
+with open(sys.argv[1]) as f:
+    s = json.load(f)
+per = s.get("per_dimension", {}).get("personalization", {})
+flu = s.get("fluency", {})
+hal = s.get("hallucination", {})
+nw_rate = flu.get("not_worse_rate") or 0.0
+hal_rate = hal.get("hallucination_rate") or 0.0
+print(f'    Samples: {s.get("sample_count", 0)}')
+print(f'    Personalization (generated vs original):')
+print(f'      generated_better : {per.get("generated_win_rate", 0):.1%}')
+print(f'      tie              : {per.get("tie_rate", 0):.1%}')
+print(f'      original_better  : {per.get("original_win_rate", 0):.1%}')
+print(f'    Fluency not-worse rate : {nw_rate:.1%}  '
+      f'({flu.get("not_worse_count", 0)}/{flu.get("checked", 0)})')
+print(f'    Hallucination rate     : {hal_rate:.1%}  '
+      f'({hal.get("hallucination_count", 0)}/{hal.get("checked", 0)})')
+print(f'    Strict win rate        : {s.get("strict_win_rate", 0):.1%}')
+PY
+}
+
 if [[ -f "${EVAL_DIR}/eval_summary_sft_${VERSION}.json" ]]; then
   echo ""
   echo "  SFT Summary (vs Original title):"
-  python3 -c "
-import json
-with open('${EVAL_DIR}/eval_summary_sft_${VERSION}.json') as f:
-    s = json.load(f)
-o = s.get('overall', {})
-print(f'    Samples: {s.get(\"sample_count\", 0)}')
-print(f'    Generated win: {o.get(\"generated_win_rate\", 0):.1%}')
-print(f'    Tie: {o.get(\"tie_rate\", 0):.1%}')
-print(f'    Original win: {o.get(\"original_win_rate\", 0):.1%}')
-print(f'    Strict win rate: {s.get(\"strict_win_rate\", 0):.1%}')
-" 2>/dev/null || echo "    (see ${EVAL_DIR}/eval_summary_sft_${VERSION}.json)"
+  _print_summary "${EVAL_DIR}/eval_summary_sft_${VERSION}.json"
 fi
 if [[ -f "${EVAL_DIR}/eval_summary_dpo_${VERSION}.json" ]]; then
   echo ""
   echo "  DPO Summary (vs Original title):"
-  python3 -c "
-import json
-with open('${EVAL_DIR}/eval_summary_dpo_${VERSION}.json') as f:
-    s = json.load(f)
-o = s.get('overall', {})
-print(f'    Samples: {s.get(\"sample_count\", 0)}')
-print(f'    Generated win: {o.get(\"generated_win_rate\", 0):.1%}')
-print(f'    Tie: {o.get(\"tie_rate\", 0):.1%}')
-print(f'    Original win: {o.get(\"original_win_rate\", 0):.1%}')
-print(f'    Strict win rate: {s.get(\"strict_win_rate\", 0):.1%}')
-" 2>/dev/null || echo "    (see ${EVAL_DIR}/eval_summary_dpo_${VERSION}.json)"
+  _print_summary "${EVAL_DIR}/eval_summary_dpo_${VERSION}.json"
 fi
 echo ""
 echo "  To view SFT judge: head -5 ${EVAL_SFT:-}"
