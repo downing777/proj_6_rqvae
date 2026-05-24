@@ -11,14 +11,19 @@ LLM-as-judge offline evaluation for SID-conditioned title generation.
     给 judge 注入 "该 SID 用户群在本商品下的真实评论" 作为用户画像证据
     (口径与 dpo_title_gen.py 完全一致, 复用其 stream_reviews_indexed / aggregate_reviews)
 
-评判方式 (每条样本两次 judge):
-  Pass 1 (比较): personalization / fluency 两个维度, 双盲对比 original vs generated。
+评判方式 (每条样本三次 judge, 并发发起):
+  Pass 1 (个性化, A/B 盲比): 只评 personalization 这一维度。
     每条随机决定 original/generated 落 A 或 B, 再把 judge 回答映射回
     (original_better / generated_better / tie)。汇总成 generated 视角的胜率。
-  Pass 2 (幻觉检测): 给 judge 商品客观信息 + 原始标题 (视为无幻觉的 ground truth)
-    + 生成标题, 让其判断生成标题是否引入了未被支持的具体声明 (属性/数字/材质/认证等),
+    prompt 内显式加了 length-neutrality 规则, 避免 judge 因标题长短产生偏置。
+  Pass 2 (幻觉检测, 单向): 给 judge 商品客观信息 + 原始标题 (视为无幻觉的 ground truth)
+    + 生成标题, 判断生成标题是否引入了未被支持的具体声明 (属性/数字/材质/认证等),
     输出 has_hallucination (bool) + hallucinated_claims (list[str])。
     汇总成 hallucination rate (有幻觉的生成标题占比) —— 不是胜率。
+  Pass 3 (流畅度, 单向): 给 judge 原标题 (作为 reference / fluency 下限) + 生成标题,
+    只问"生成标题的流畅度是否明显比原标题下降", 输出 fluency_drop (bool)。
+    保守裁决 (旗鼓相当就 false), 汇总成 fluency_not_worse_rate
+    (流畅度没退化的样本占比) —— 不是胜率。
 
 依赖: pip install openai tqdm
 """
@@ -89,7 +94,14 @@ def to_sid_tuple(sid: Any) -> Optional[SidTuple]:
         return None
 
 
-_ORIGINAL_TITLE_RE = re.compile(r"^\s*Original title:\s*(.+)$", re.IGNORECASE)
+# 同时兼容 dpo_title_gen 的 "Original title: ..." 和 build_eval_data 的
+# "原商品标题(英文): ..." / "原商品标题: ..." (全角/半角冒号都接受)。
+# 不修这里, build_eval_data 出来的 context 会让 compare judge 直接看到原标题,
+# A/B 盲比就失效了。
+_ORIGINAL_TITLE_RE = re.compile(
+    r"^\s*(?:Original\s+title|原商品标题(?:\s*\(英文\))?)\s*[:：]\s*(.+)$",
+    re.IGNORECASE,
+)
 
 
 def extract_original_title(context: str) -> str:
@@ -214,16 +226,23 @@ def build_samples(
 JUDGE_COMPARE_SYSTEM_PROMPT = (
     "You are a strict, careful evaluator for e-commerce product titles. "
     "Given a product's objective info, real reviews from the target user group, "
-    "and two candidate titles (labeled A and B), compare them on the TWO dimensions below. "
-    "Judge each dimension independently — do NOT give an overall preference.\n"
-    "Dimensions:\n"
-    "1) personalization: Which title better matches the interests / preferences of the target user group "
+    "and two candidate titles (labeled A and B), judge ONE dimension: personalization.\n\n"
+    "CRITICAL LENGTH-NEUTRALITY RULE:\n"
+    "- Title length itself is NOT a quality signal. Do NOT prefer a title for being longer, "
+    "\"more descriptive\", or \"having more keywords\". Do NOT penalize a title for being concise.\n"
+    "- A short, focused title can be equally or more personalized compared with a long, "
+    "keyword-stuffed one. A long title is not automatically more informative — it may just be "
+    "repetitive or noisy.\n"
+    "- Two titles of very different length can absolutely be a tie. When in doubt about length, "
+    "output tie rather than rewarding the longer one.\n"
+    "- Judge ONLY the content quality, regardless of word count or character count.\n\n"
+    "personalization: Which title better matches the interests / preferences of the target user group "
     "as revealed by their reviews (highlights features they care about, uses framing that resonates)? "
-    "Values: A_better / B_better / tie. If user-group evidence is empty, output tie.\n"
-    "2) fluency: Is the English natural and well-formed (word order, collocations, no repeated tokens / "
-    "gibberish / awkward concatenation)? Values: A_better / B_better / tie.\n"
-    "Do NOT judge factual accuracy / hallucination here — that is evaluated in a separate pass.\n"
-    "Output STRICTLY a single JSON object with fields personalization, fluency, reason. "
+    "Values: A_better / B_better / tie. If user-group evidence is empty, output tie. "
+    "Listing many generic keywords does NOT count as personalization — the highlighted feature must "
+    "actually be something the user-group reviews care about.\n\n"
+    "Do NOT judge fluency or factual accuracy / hallucination here — those are evaluated in separate passes.\n"
+    "Output STRICTLY a single JSON object with fields personalization, reason. "
     "reason is a one-sentence explanation. No additional text."
 )
 
@@ -234,7 +253,6 @@ JUDGE_COMPARE_USER_TEMPLATE = (
     "[Candidate B]\n{title_b}\n\n"
     "Output JSON only: "
     "{{\"personalization\": \"A_better|B_better|tie\", "
-    "\"fluency\": \"A_better|B_better|tie\", "
     "\"reason\": \"...\"}}"
 )
 
@@ -266,6 +284,38 @@ JUDGE_HALLU_USER_TEMPLATE = (
     "Output JSON only: "
     "{{\"has_hallucination\": true|false, "
     "\"hallucinated_claims\": [\"...\"], "
+    "\"reason\": \"...\"}}"
+)
+
+
+JUDGE_FLUENCY_SYSTEM_PROMPT = (
+    "You are a strict English-fluency reviewer for e-commerce product titles. "
+    "You will be given a REFERENCE title (the original product title, treated as the fluency floor) "
+    "and a CANDIDATE title (a newly generated title to check). "
+    "Your ONLY task: decide whether the CANDIDATE is meaningfully LESS FLUENT than the REFERENCE "
+    "as an English product title. You are NOT asked which is 'better' or 'more attractive'.\n\n"
+    "What counts as a fluency drop (answer true):\n"
+    "- Broken grammar or word order in the CANDIDATE that the REFERENCE does not have.\n"
+    "- Repeated tokens, gibberish, garbled or non-English text in the CANDIDATE.\n"
+    "- Awkward concatenations that read clearly worse than the REFERENCE.\n"
+    "- A truncation that leaves a dangling word, half-word, or unfinished phrase.\n\n"
+    "What does NOT count as a fluency drop (answer false):\n"
+    "- The CANDIDATE being shorter (or longer) than the REFERENCE. Length is NOT fluency.\n"
+    "- Different word choice, paraphrasing, or reordering, as long as the result still reads naturally.\n"
+    "- Title-case vs. sentence-case differences.\n"
+    "- Dropping or omitting information that was in the REFERENCE (that is not a fluency issue).\n"
+    "- The CANDIDATE adding new content, as long as it reads naturally (factuality is judged elsewhere).\n\n"
+    "Be CONSERVATIVE: if the two read at roughly comparable fluency, answer false. "
+    "Only answer true when the CANDIDATE has a clear, identifiable fluency problem the REFERENCE does not have.\n"
+    "Output STRICTLY a single JSON object with fields fluency_drop (true|false), reason (one sentence). "
+    "No additional text."
+)
+
+JUDGE_FLUENCY_USER_TEMPLATE = (
+    "[Reference title (original, fluency floor)]\n{original_title}\n\n"
+    "[Candidate title (to check)]\n{generated_title}\n\n"
+    "Output JSON only: "
+    "{{\"fluency_drop\": true|false, "
     "\"reason\": \"...\"}}"
 )
 
@@ -329,7 +379,10 @@ def _to_bool(value: Any) -> bool:
     return False
 
 
-_COMPARE_DIMS: Tuple[str, ...] = ("personalization", "fluency")
+# 现在 compare pass 只剩 personalization 一个维度。
+# fluency 改成单向 not-worse 检查 (见 normalize_fluency), 不再走 A/B 比较;
+# hallucination 一直就是单向检查。
+_COMPARE_DIMS: Tuple[str, ...] = ("personalization",)
 
 
 def normalize_compare(raw: Dict[str, Any], original_pos: str) -> Dict[str, Any]:
@@ -359,13 +412,24 @@ def normalize_hallucination(raw: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def normalize_fluency(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """fluency_drop=True 表示生成标题比原标题流畅度明显下降; 否则视为 not_worse。
+    我们对外暴露 fluency_not_worse (= not fluency_drop), 语义更直接。"""
+    drop = _to_bool(raw.get("fluency_drop", False))
+    return {
+        "fluency_drop": drop,
+        "fluency_not_worse": (not drop),
+        "reason": str(raw.get("reason", ""))[:500],
+    }
+
+
 def is_strict_win(row: Dict[str, Any]) -> bool:
-    """严格胜出: 生成标题无幻觉 + personalization/fluency 全部不输 + 至少一项更好。"""
+    """严格胜出: 无幻觉 + 流畅度没下降 + personalization 上 generated 更好。"""
     if row.get("has_hallucination"):
         return False
-    if any(row.get(k) == "original_better" for k in _COMPARE_DIMS):
+    if not row.get("fluency_not_worse", True):
         return False
-    return any(row.get(k) == "generated_better" for k in _COMPARE_DIMS)
+    return row.get("personalization") == "generated_better"
 
 
 # --------------------------------------------------------------------------- #
@@ -486,6 +550,35 @@ async def judge_hallucination(
     return norm, meta, usage
 
 
+async def judge_fluency(
+    client: AsyncOpenAI,
+    model: str,
+    sample: JudgeSample,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    request_timeout: float,
+    max_retries: int,
+    base_delay: float,
+    extra_body: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, int]]]:
+    user_msg = JUDGE_FLUENCY_USER_TEMPLATE.format(
+        original_title=sample.original_title,
+        generated_title=sample.generated_title,
+    )
+
+    async def _do() -> Tuple[Dict[str, Any], Optional[Dict[str, int]]]:
+        return await _chat_json(
+            client, model, JUDGE_FLUENCY_SYSTEM_PROMPT, user_msg,
+            max_tokens, temperature, top_p, request_timeout, extra_body,
+        )
+
+    parsed, usage = await _with_retry(_do, max_retries, base_delay)
+    norm = normalize_fluency(parsed)
+    meta = {"raw_judge": parsed}
+    return norm, meta, usage
+
+
 def judge_key(item_id: str, sid: SidTuple) -> str:
     return f"{item_id}::{','.join(str(x) for x in sid)}"
 
@@ -532,8 +625,11 @@ def wilson_ci(successes: int, total: int, z: float = 1.96) -> Optional[Tuple[flo
 
 
 def summarize(judgments: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """personalization / fluency 仍按 generated 视角统计胜率;
-    hallucination 单独按 generated 标题的幻觉发生率统计 (非胜率)。"""
+    """三个维度三种口径:
+      - personalization: A/B 盲比, 报 generated 视角的胜率/平局率/败率;
+      - fluency: 单向 not-worse 检查, 报 fluency_not_worse_rate (没退化的样本占比);
+      - hallucination: 单向幻觉检测, 报 hallucination_rate (有幻觉的样本占比)。
+    胜率仅适用于 personalization, fluency/hallucination 不再有"胜率"概念。"""
     n = len(judgments)
     if n == 0:
         return {"sample_count": 0}
@@ -550,6 +646,13 @@ def summarize(judgments: List[Dict[str, Any]]) -> Dict[str, Any]:
             "wilson95_generated_win_rate": wilson_ci(gw, n),
         }
 
+    fluency_checked = sum(1 for j in judgments if "fluency_not_worse" in j)
+    fluency_not_worse = sum(1 for j in judgments if j.get("fluency_not_worse"))
+    fluency_drop = sum(1 for j in judgments
+                       if "fluency_not_worse" in j and not j.get("fluency_not_worse"))
+    fluency_nw_rate = (fluency_not_worse / fluency_checked) if fluency_checked > 0 else None
+    fluency_nw_ci = wilson_ci(fluency_not_worse, fluency_checked) if fluency_checked > 0 else None
+
     hallu_checked = sum(1 for j in judgments if "has_hallucination" in j)
     hallu_count = sum(1 for j in judgments if j.get("has_hallucination"))
     hallu_rate = (hallu_count / hallu_checked) if hallu_checked > 0 else None
@@ -560,12 +663,19 @@ def summarize(judgments: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     return {
         "sample_count": n,
-        # generated 视角的胜率, 仅 personalization + fluency 两个维度
+        # generated 视角的胜率, 现在只剩 personalization
         "win_rates": {
             "personalization": per_dim["personalization"]["generated_win_rate"],
-            "fluency": per_dim["fluency"]["generated_win_rate"],
         },
         "per_dimension": per_dim,
+        # fluency: 单向 not-worse 检查 (没退化的占比), 不是胜率
+        "fluency": {
+            "checked": fluency_checked,
+            "not_worse_count": fluency_not_worse,
+            "drop_count": fluency_drop,
+            "not_worse_rate": fluency_nw_rate,
+            "wilson95_not_worse_rate": fluency_nw_ci,
+        },
         # 幻觉率: 生成标题中包含未支持声明的比例 (非胜率)
         "hallucination": {
             "checked": hallu_checked,
@@ -573,7 +683,7 @@ def summarize(judgments: List[Dict[str, Any]]) -> Dict[str, Any]:
             "hallucination_rate": hallu_rate,
             "wilson95_hallucination_rate": hallu_ci,
         },
-        # 严格胜出: 无幻觉 + personalization/fluency 全部不输 + 至少一项更好
+        # 严格胜出: 无幻觉 + 流畅度没下降 + personalization 上 generated 更好
         "strict_win_rate": strict_wins / n,
         "wilson95_strict_win_rate": wilson_ci(strict_wins, n),
         "sid_bucket_count": len(sid_buckets),
@@ -609,8 +719,8 @@ async def amain() -> int:
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--max-concurrency", type=int, default=4,
-                    help="并发处理的样本数; 每条样本会并发发起 2 次 judge 请求, "
-                         "因此对 vLLM 的实际并发可达 2x。")
+                    help="并发处理的样本数; 每条样本会并发发起 3 次 judge 请求 "
+                         "(compare/hallucination/fluency), 因此对 vLLM 的实际并发可达 3x。")
     ap.add_argument("--max-retries", type=int, default=4)
     ap.add_argument("--retry-base-delay", type=float, default=1.0)
     ap.add_argument("--request-timeout", type=float, default=180.0)
@@ -701,7 +811,10 @@ async def amain() -> int:
             return
         async with sem:
             try:
-                # 两个 judge pass 并发: compare (personalization+fluency) 与 幻觉检测
+                # 三个 judge pass 并发:
+                #   compare (personalization, A/B 盲比)
+                #   hallucination (单向, 检查生成标题有无未支持声明)
+                #   fluency (单向, 检查生成标题流畅度是否比原标题下降)
                 cmp_task = judge_compare(
                     client=client, model=args.model, sample=s, seed=args.seed,
                     max_tokens=args.max_tokens, temperature=args.temperature,
@@ -716,18 +829,29 @@ async def amain() -> int:
                     max_retries=args.max_retries, base_delay=args.retry_base_delay,
                     extra_body=extra_body,
                 )
-                (cmp_norm, cmp_meta, cmp_usage), (hal_norm, hal_meta, hal_usage) = \
-                    await asyncio.gather(cmp_task, hal_task)
+                flu_task = judge_fluency(
+                    client=client, model=args.model, sample=s,
+                    max_tokens=args.max_tokens, temperature=args.temperature,
+                    top_p=args.top_p, request_timeout=args.request_timeout,
+                    max_retries=args.max_retries, base_delay=args.retry_base_delay,
+                    extra_body=extra_body,
+                )
+                (cmp_norm, cmp_meta, cmp_usage), \
+                (hal_norm, hal_meta, hal_usage), \
+                (flu_norm, flu_meta, flu_usage) = \
+                    await asyncio.gather(cmp_task, hal_task, flu_task)
                 row: Dict[str, Any] = {
                     "item_id": s.item_id,
                     "sid": list(s.sid),
                     "original_title": s.original_title,
                     "generated_title": s.generated_title,
                     "personalization": cmp_norm["personalization"],
-                    "fluency": cmp_norm["fluency"],
+                    "fluency_not_worse": flu_norm["fluency_not_worse"],
+                    "fluency_drop": flu_norm["fluency_drop"],
                     "has_hallucination": hal_norm["has_hallucination"],
                     "hallucinated_claims": hal_norm["hallucinated_claims"],
                     "reason_compare": cmp_norm["reason"],
+                    "reason_fluency": flu_norm["reason"],
                     "reason_hallucination": hal_norm["reason"],
                     "judge_meta": {"original_pos": cmp_meta["original_pos"]},
                 }
@@ -738,7 +862,11 @@ async def amain() -> int:
                         f.flush()
                     existing.add(k)
                     with open(usage_path, "a", encoding="utf-8") as uf:
-                        for stage, usage in (("compare", cmp_usage), ("hallucination", hal_usage)):
+                        for stage, usage in (
+                            ("compare", cmp_usage),
+                            ("hallucination", hal_usage),
+                            ("fluency", flu_usage),
+                        ):
                             urec = {
                                 "ts": time.time(),
                                 "item_id": s.item_id,
@@ -751,7 +879,7 @@ async def amain() -> int:
                         uf.flush()
                 async with stats_lock:
                     stats["ok"] += 1
-                    for usage in (cmp_usage, hal_usage):
+                    for usage in (cmp_usage, hal_usage, flu_usage):
                         if usage:
                             stats["requests_with_usage"] += 1
                             stats["prompt_tokens"] += int(usage.get("prompt_tokens", 0) or 0)
@@ -795,7 +923,7 @@ async def amain() -> int:
         "sum_completion_tokens": stats["completion_tokens"],
         "sum_total_tokens": stats["total_tokens"],
         "judge_model": args.model,
-        "calls_per_sample": 2,
+        "calls_per_sample": 3,
     }
     summary["paths"] = {
         "pred_jsonl": args.pred_jsonl,
