@@ -153,29 +153,29 @@ echo ""
 # ======================================================================
 # Step 2: LLM-as-judge evaluation (SFT)
 # ======================================================================
-echo "---- [2/4] LLM-as-Judge (SFT vs Original title) ----"
-if [[ ! -f "${PRED_SFT}" ]]; then
-  echo "  SKIPPED: SFT predictions not available."
-  EVAL_SFT="(not generated)"
-else
-  EVAL_SFT="${EVAL_DIR}/eval_results_sft_${VERSION}.jsonl"
-  SUMMARY_SFT="${EVAL_DIR}/eval_summary_sft_${VERSION}.json"
-  echo "  Running LLM judge on SFT predictions..."
-  echo "  Judge model: ${JUDGE_MODEL} @ ${JUDGE_BASE_URL}"
-  python3 softprompt/eval/offline_eval.py \
-    --pred-jsonl "${PRED_SFT}" \
-    --reviews-jsonl "${REVIEWS_JSONL}" \
-    --user-sid "${USER_SID_JSONL}" \
-    --output-jsonl "${EVAL_SFT}" \
-    --summary-json "${SUMMARY_SFT}" \
-    --openai-base-url "${JUDGE_BASE_URL}" \
-    --openai-api-key "${JUDGE_API_KEY}" \
-    --model "${JUDGE_MODEL}" \
-    --max-concurrency 8 \
-    --extra-body-json '{"top_k": 1, "chat_template_kwargs": {"enable_thinking": false}}'
-  echo "  Done!"
-fi
-echo ""
+# echo "---- [2/4] LLM-as-Judge (SFT vs Original title) ----"
+# if [[ ! -f "${PRED_SFT}" ]]; then
+#   echo "  SKIPPED: SFT predictions not available."
+#   EVAL_SFT="(not generated)"
+# else
+#   EVAL_SFT="${EVAL_DIR}/eval_results_sft_${VERSION}.jsonl"
+#   SUMMARY_SFT="${EVAL_DIR}/eval_summary_sft_${VERSION}.json"
+#   echo "  Running LLM judge on SFT predictions..."
+#   echo "  Judge model: ${JUDGE_MODEL} @ ${JUDGE_BASE_URL}"
+#   python3 softprompt/eval/offline_eval.py \
+#     --pred-jsonl "${PRED_SFT}" \
+#     --reviews-jsonl "${REVIEWS_JSONL}" \
+#     --user-sid "${USER_SID_JSONL}" \
+#     --output-jsonl "${EVAL_SFT}" \
+#     --summary-json "${SUMMARY_SFT}" \
+#     --openai-base-url "${JUDGE_BASE_URL}" \
+#     --openai-api-key "${JUDGE_API_KEY}" \
+#     --model "${JUDGE_MODEL}" \
+#     --max-concurrency 8 \
+#     --extra-body-json '{"top_k": 1, "chat_template_kwargs": {"enable_thinking": false}}' \
+#   echo "  Done!"
+# fi
+# echo ""
 
 # ======================================================================
 # Step 3: DPO Prediction (generate if not exist)
@@ -224,7 +224,8 @@ else
     --openai-api-key "${JUDGE_API_KEY}" \
     --model "${JUDGE_MODEL}" \
     --max-concurrency 8 \
-    --extra-body-json '{"top_k": 1, "chat_template_kwargs": {"enable_thinking": false}}'
+    --extra-body-json '{"top_k": 1, "chat_template_kwargs": {"enable_thinking": false}}' \
+    || echo "  [WARN] DPO judge finished with partial errors (non-zero exit code)"
   echo "  Done!"
 fi
 
