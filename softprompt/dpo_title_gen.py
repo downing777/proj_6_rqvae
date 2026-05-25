@@ -381,12 +381,18 @@ def parse_json_object(text: str) -> Dict[str, Any]:
 
 SYSTEM_PROMPT = (
     "You are an Amazon product title optimization assistant. Given product information, "
-    "a target user segment (SID), and review evidence from that segment, generate a short, "
+    "a target user segment (SID), and review evidence from that segment, generate a "
     "compelling English product title tailored to the target SID group's preferences.\n"
     "Requirements:\n"
-    "1) The title must be in English, around 10-20 words.\n"
-    "2) The title must highlight what the target SID user group cares about based on their reviews.\n"
-    "3) Do NOT invent features that don't exist in the product.\n"
+    "1) The title must be in English. Match the length and style of the original title — "
+    "if the original is long and descriptive, yours should be similarly detailed; "
+    "if the original is short, keep yours concise. Do NOT artificially shorten or lengthen.\n"
+    "2) The title must highlight what the target SID user group cares about based on their reviews, "
+    "while retaining the essential product identity (brand, model, core function) from the original.\n"
+    "3) Do NOT invent features, specs, materials, or certifications that are not supported by "
+    "the product info or the reviews.\n"
+    "4) The title should read naturally as a real Amazon product title — Title Case, no terminal "
+    "period, no markdown, no quotes.\n"
     "Output ONLY a JSON object with key: title. No other text."
 )
 
@@ -510,61 +516,6 @@ def load_existing_titles(path: str) -> Dict[str, str]:
     return out
 
 
-def build_dpo_pairs(
-    titles_by_item: Dict[str, Dict[SidTuple, str]],
-    task_user_map: Dict[str, List[str]],
-    training_context_map: Dict[str, str],
-    num_hard_negatives: int,
-    seed: int,
-) -> List[Dict[str, Any]]:
-    """Phase 2: Cross-combine titles within each item to build DPO pairs.
-
-    For each (item, SID), the chosen title is the one generated for that SID.
-    The rejected titles are randomly sampled from other SIDs under the same item.
-    Each pair is expanded to (user, item) granularity.
-    """
-    rng = random.Random(seed)
-    dpo_rows: List[Dict[str, Any]] = []
-
-    for item_id, sid_titles in titles_by_item.items():
-        sids = sorted(sid_titles.keys())
-        if len(sids) < 2:
-            continue  # Need at least 2 SIDs to build DPO pairs
-
-        for sid in sids:
-            chosen_title = sid_titles[sid]
-            other_sids = [s for s in sids if s != sid]
-
-            # Sample up to num_hard_negatives from other SIDs
-            num_to_pick = min(num_hard_negatives, len(other_sids))
-            selected_others = rng.sample(other_sids, num_to_pick)
-
-            # Get user_ids for this (item, sid) pair
-            key = gen_task_key(item_id, sid)
-            user_ids = task_user_map.get(key, [])
-            train_ctx = training_context_map.get(key, "")
-
-            for other_sid in selected_others:
-                rejected_title = sid_titles[other_sid]
-                # Expand to each user under this SID
-                for uid in user_ids:
-                    dpo_rows.append(
-                        {
-                            "user_id": uid,
-                            "item_id": item_id,
-                            "sid": list(sid),
-                            "context": train_ctx,
-                            "title_chosen": chosen_title,
-                            "title_rejected": rejected_title,
-                            "negative_type": "hard_cross_sid",
-                            "meta": {
-                                "source": "dpo_title_gen_cross",
-                                "cross_against": list(other_sid),
-                            },
-                        }
-                    )
-
-    return dpo_rows
 
 async def amain() -> int:
     default_user_sid = (
@@ -633,12 +584,6 @@ async def amain() -> int:
     ap.add_argument("--max-review-chars", type=int, default=3000)
     ap.add_argument("--min-review-chars", type=int, default=8)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument(
-        "--num-hard-negatives",
-        type=int,
-        default=3,
-        help="每个chosen样本生成的hard负样本数量（来自不同SID群体）",
-    )
     ap.add_argument(
         "--skip-existing", action=argparse.BooleanOptionalAction, default=True
     )
@@ -858,19 +803,12 @@ async def amain() -> int:
     print(f"Phase 1 complete: {_st['ok']} titles generated, {_st['err']} errors.")
     print(f"Total titles available: {len(existing_titles)}")
 
-    # ---- Phase 2: Cross-combine titles to build DPO pairs ----
-    print("Phase 2: Building DPO pairs by cross-combining titles within each item...")
+    # ---- Write output: one row per (item, SID) with title_chosen ----
+    # Output schema is compatible with build_dpo_far_sid_1to1.py input:
+    #   {item_id, sid, title_chosen, context, user_id, ...}
+    print("Writing output (one row per user per (item, SID))...")
 
-    # Group titles by item_id
-    titles_by_item: Dict[str, Dict[SidTuple, str]] = defaultdict(dict)
-    for key, title in existing_titles.items():
-        parts = key.split("::")
-        item_id = parts[0]
-        sid_parts = parts[1].split(",")
-        sid = (int(sid_parts[0]), int(sid_parts[1]), int(sid_parts[2]))
-        titles_by_item[item_id][sid] = title
-
-    # Build user_id and training_context maps from tasks
+    # Build maps from tasks
     task_user_map: Dict[str, List[str]] = {}
     training_context_map: Dict[str, str] = {}
     for t in tasks:
@@ -878,17 +816,29 @@ async def amain() -> int:
         task_user_map[key] = t.user_ids
         training_context_map[key] = t.training_context
 
-    dpo_rows = build_dpo_pairs(
-        titles_by_item, task_user_map, training_context_map,
-        args.num_hard_negatives, args.seed,
-    )
-
-    # Write DPO pairs to output
+    output_count = 0
     with open(args.output_jsonl, "w", encoding="utf-8") as f:
-        for row in dpo_rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        for key, title in existing_titles.items():
+            parts = key.split("::")
+            item_id = parts[0]
+            sid_parts = parts[1].split(",")
+            sid = (int(sid_parts[0]), int(sid_parts[1]), int(sid_parts[2]))
+            user_ids = task_user_map.get(key, [])
+            train_ctx = training_context_map.get(key, "")
 
-    print(f"Phase 2 complete: {len(dpo_rows)} DPO pairs written to {args.output_jsonl}")
+            # Expand to each user under this SID (one row per user)
+            for uid in user_ids:
+                row = {
+                    "user_id": uid,
+                    "item_id": item_id,
+                    "sid": list(sid),
+                    "context": train_ctx,
+                    "title_chosen": title,
+                }
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                output_count += 1
+
+    print(f"Output complete: {output_count} rows written to {args.output_jsonl}")
     print(
         json.dumps(
             {
@@ -902,8 +852,7 @@ async def amain() -> int:
                     "sum_total_tokens": _st["total_tokens"],
                 },
                 "total_titles_generated": len(existing_titles),
-                "total_dpo_pairs": len(dpo_rows),
-                "items_with_cross_sids": sum(1 for v in titles_by_item.values() if len(v) >= 2),
+                "total_output_rows": output_count,
                 "successful_api_calls": _st["ok"],
                 "errors": _st["err"],
             },

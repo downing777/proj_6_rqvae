@@ -47,9 +47,6 @@ except ImportError as e:  # pragma: no cover
     raise e
 
 
-DEFAULT_OPENAI_BASE_URL = "http://localhost:8000/v1"
-DEFAULT_OPENAI_API_KEY = "EMPTY"
-DEFAULT_MODEL = "Qwen/Qwen2.5-32B-Instruct"
 
 SidTuple = Tuple[int, ...]
 
@@ -212,17 +209,28 @@ async def _chat_text(
     request_timeout: float,
     extra_body: Optional[Dict[str, Any]],
 ) -> Tuple[str, Optional[Dict[str, int]]]:
-    kwargs: Dict[str, Any] = {
-        "model": model,
-        "messages": [
+    # Build messages: if max_tokens <= 0 (minimal-params mode), merge system into user
+    # to avoid providers that reject system role
+    if max_tokens <= 0:
+        merged_content = system_prompt + "\n\n" + user_prompt
+        messages = [{"role": "user", "content": merged_content}]
+    else:
+        messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "timeout": request_timeout,
+        ]
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
     }
+    if max_tokens > 0:
+        kwargs["max_tokens"] = max_tokens
+    if temperature >= 0:
+        kwargs["temperature"] = temperature
+    if top_p < 1.0:
+        kwargs["top_p"] = top_p
+    if request_timeout > 0:
+        kwargs["timeout"] = request_timeout
     if extra_body:
         kwargs["extra_body"] = extra_body
     resp = await client.chat.completions.create(**kwargs)
@@ -230,6 +238,40 @@ async def _chat_text(
     if not raw.strip():
         raise ValueError("Empty model response")
     return raw, extract_usage(resp)
+
+
+async def _chat_text_raw(
+    base_url: str,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> Tuple[str, Optional[Dict[str, int]]]:
+    """Minimal raw HTTP call — only model+messages, no extra params.
+    Used for providers (like idealab) that reject any additional fields."""
+    import httpx
+    url = base_url.rstrip("/") + "/chat/completions"
+    merged_content = system_prompt + "\n\n" + user_prompt
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": merged_content}],
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    async with httpx.AsyncClient(timeout=300.0) as http_client:
+        resp = await http_client.post(url, json=payload, headers=headers)
+        if resp.status_code != 200:
+            raise ValueError(
+                f"HTTP {resp.status_code} from {url}: {resp.text[:500]}"
+            )
+    data = resp.json()
+    raw = data["choices"][0]["message"]["content"] or ""
+    if not raw.strip():
+        raise ValueError("Empty model response")
+    usage = data.get("usage")
+    return raw, usage
 
 
 async def _with_retry(
@@ -241,7 +283,7 @@ async def _with_retry(
     for attempt in range(max_retries + 1):
         try:
             return await fn()
-        except (APIError, APIConnectionError, APITimeoutError, ValueError) as e:
+        except (APIError, APIConnectionError, APITimeoutError, ValueError, Exception) as e:
             last = e
             if attempt >= max_retries:
                 break
@@ -302,9 +344,9 @@ async def amain() -> int:
                     help="预测结果, schema 与 softprompt.infer.generate_title 一致")
     ap.add_argument("--usage-jsonl", type=str, default="",
                     help="token 用量, 默认 <output-jsonl>.usage.jsonl")
-    ap.add_argument("--openai-base-url", type=str, default=DEFAULT_OPENAI_BASE_URL)
-    ap.add_argument("--openai-api-key", type=str, default=DEFAULT_OPENAI_API_KEY)
-    ap.add_argument("--model", type=str, default=DEFAULT_MODEL,
+    ap.add_argument("--openai-base-url", type=str)
+    ap.add_argument("--openai-api-key", type=str)
+    ap.add_argument("--model", type=str,
                     help="基线模型 (建议跟被对比的训练模型同级或更强)")
     ap.add_argument("--target-words", type=int, default=12,
                     help="提示模型把标题控制在多少个英文单词左右 (默认 12, 跟训练目标的短标题对齐)")
@@ -326,7 +368,17 @@ async def amain() -> int:
     ap.add_argument("--no-progress", action="store_true")
     ap.add_argument("--extra-body-json", type=str, default="",
                     help="vLLM extra_body JSON; 默认空 (即纯采样)")
+    ap.add_argument("--minimal-params", action="store_true", default=False,
+                    help="Only send model+messages to the API; skip temperature/top_p/max_tokens "
+                         "(for providers like GPT-5 that reject unsupported params)")
     args = ap.parse_args()
+
+    # --minimal-params: 只传 model+messages, 其他参数全部跳过
+    if args.minimal_params:
+        args.temperature = -1.0       # sentinel: skip
+        args.top_p = 1.0              # sentinel: skip
+        args.max_tokens = 0           # sentinel: skip
+        args.request_timeout = 0.0    # sentinel: skip
 
     if not os.path.isfile(args.input_jsonl):
         print(f"ERROR: --input-jsonl not found: {args.input_jsonl}", file=sys.stderr)
@@ -402,15 +454,22 @@ async def amain() -> int:
         sys_p, usr_p = build_prompts(s["context"], args.target_words)
         async with sem:
             try:
-                async def _do() -> Tuple[str, Optional[Dict[str, int]]]:
-                    return await _chat_text(
-                        client, args.model, sys_p, usr_p,
-                        max_tokens=args.max_tokens,
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        request_timeout=args.request_timeout,
-                        extra_body=extra_body,
-                    )
+                if args.minimal_params:
+                    async def _do() -> Tuple[str, Optional[Dict[str, int]]]:
+                        return await _chat_text_raw(
+                            args.openai_base_url, args.openai_api_key,
+                            args.model, sys_p, usr_p,
+                        )
+                else:
+                    async def _do() -> Tuple[str, Optional[Dict[str, int]]]:
+                        return await _chat_text(
+                            client, args.model, sys_p, usr_p,
+                            max_tokens=args.max_tokens,
+                            temperature=args.temperature,
+                            top_p=args.top_p,
+                            request_timeout=args.request_timeout,
+                            extra_body=extra_body,
+                        )
 
                 raw, usage = await _with_retry(_do, args.max_retries, args.retry_base_delay)
                 title = clean_generated_title(raw)

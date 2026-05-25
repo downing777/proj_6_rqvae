@@ -103,6 +103,8 @@ def _evaluate_experiment(
     unique_sid_values: List[float] = []
     item_size_values: List[float] = []
 
+    global_sid_set: set = set()
+
     out_rows: List[List[object]] = []
 
     for item_id, users in item_to_users.items():
@@ -113,6 +115,7 @@ def _evaluate_experiment(
         total_user_links += len(users)
         sids = [user_to_sid[u] for u in users if u in user_to_sid]
         matched_user_links += len(sids)
+        global_sid_set.update(sids)
         if len(sids) < min_users_per_item:
             dropped_item_count += 1
             continue
@@ -172,8 +175,15 @@ def _evaluate_experiment(
         weighted_entropy_num += ent * n
         weight_den += n
 
+    # 也统计不在任何 item 下的用户的 SID
+    global_sid_set.update(user_to_sid.values())
+    global_active_sids = len(global_sid_set)
+    total_users = len(user_to_sid)
+
     return {
         "experiment": exp_name,
+        "total_users": float(total_users),
+        "global_active_sids": float(global_active_sids),
         "items_total": float(len(item_to_users)),
         "items_kept": float(kept_item_count),
         "items_dropped": float(dropped_item_count),
@@ -200,6 +210,8 @@ def _evaluate_experiment(
 def _print_summary(rows: List[Dict[str, float]]) -> None:
     headers = [
         "experiment",
+        "total_users",
+        "global_active_sids",
         "items_kept",
         "matched_link_coverage",
         "entropy_p50",
@@ -213,6 +225,8 @@ def _print_summary(rows: List[Dict[str, float]]) -> None:
             "\t".join(
                 [
                     str(row["experiment"]),
+                    f"{int(row['total_users'])}",
+                    f"{int(row['global_active_sids'])}",
                     f"{int(row['items_kept'])}",
                     f"{row['matched_link_coverage']:.4f}",
                     f"{row['entropy_p50']:.4f}",
@@ -294,6 +308,8 @@ def main() -> None:
     os.makedirs(os.path.dirname(args.summary_csv_path), exist_ok=True)
     summary_headers = [
         "experiment",
+        "total_users",
+        "global_active_sids",
         "items_total",
         "items_kept",
         "items_dropped",

@@ -210,8 +210,8 @@ if [[ ! -f "${PRED_DPO}" ]]; then
   echo "  SKIPPED: DPO predictions not available."
   EVAL_DPO="(not generated)"
 else
-  EVAL_DPO="${EVAL_DIR}/eval_results_dpo_${VERSION}.jsonl"
-  SUMMARY_DPO="${EVAL_DIR}/eval_summary_dpo_${VERSION}.json"
+  EVAL_DPO="${EVAL_DIR}/eval_results_dpo_${VERSION}_xlength.jsonl"
+  SUMMARY_DPO="${EVAL_DIR}/eval_summary_dpo_${VERSION}_xlength.json"
   echo "  Running LLM judge on DPO predictions..."
   echo "  Judge model: ${JUDGE_MODEL} @ ${JUDGE_BASE_URL}"
   python3 softprompt/eval/offline_eval.py \

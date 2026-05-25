@@ -467,7 +467,9 @@ def _train_rqvae(
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
-        quantized = model.get_semantic_ids(x, gumbel_t=0.2)
+        # Gumbel temperature annealing: start high (1.0) and decay to 0.1
+        gumbel_t = max(0.1, 1.0 * (0.999 ** step))
+        quantized = model.get_semantic_ids(x, gumbel_t=gumbel_t)
         x_hat = model.decode(quantized.embeddings.sum(axis=-1))
         if model.n_cat_feats > 0:
             x_hat = torch.cat(
@@ -503,12 +505,20 @@ def _train_rqvae(
         optimizer.step()
 
         if step % 100 == 0 or step == 1 or step == iterations:
+            # Compute codebook utilization per layer
+            cb_utils = []
+            for layer in model.layers:
+                active = (layer.code_usage_ema >= layer.dead_code_threshold).sum().item()
+                cb_utils.append(f"{int(active)}/{layer.n_embed}")
+            cb_str = ",".join(cb_utils)
+
             msg = (
                 f"[train] step={step}/{iterations} "
                 f"loss={loss.item():.4f} "
                 f"base={base_loss.item():.4f} "
                 f"rec={reconstruction_loss.mean().item():.4f} "
-                f"vq={rqvae_loss.mean().item():.4f}"
+                f"vq={rqvae_loss.mean().item():.4f} "
+                f"t={gumbel_t:.3f} cb=[{cb_str}]"
             )
             if use_item_mi_loss:
                 msg += (
@@ -524,7 +534,11 @@ def _train_rqvae(
                 "base_loss": float(base_loss.item()),
                 "reconstruction_loss": float(reconstruction_loss.mean().item()),
                 "vq_loss": float(rqvae_loss.mean().item()),
+                "gumbel_t": float(gumbel_t),
             }
+            for layer_idx, layer in enumerate(model.layers):
+                active = (layer.code_usage_ema >= layer.dead_code_threshold).sum().item()
+                logs[f"cb_active_layer{layer_idx}"] = active
             if use_item_mi_loss:
                 logs.update(
                     {
@@ -607,25 +621,25 @@ def main() -> None:
     parser.add_argument(
         "--built-data-path",
         type=str,
-        default="amazon_emb/amazon_user_item_dataset.user.npz",
+        default="/home/yuanhanyang.yhy/model_hub/amazon_user/amazon_user_item_dataset.user.npz",
         help="Path to dataset base .npz or split .user.npz (for example amazon_user_item_dataset.npz or amazon_user_item_dataset.user.npz).",
     )
     parser.add_argument(
         "--item-user-map-path",
         type=str,
-        default="amazon_raw/item_to_user_ids.json",
+        default="/home/yuanhanyang.yhy/model_hub/amazon_user/raw/item_to_user_ids.json",
         help="JSON file mapping item_id -> [user_id], used to build item-side user distribution for sampling.",
     )
-    parser.add_argument("--output-dir", type=str, default="outputs")
+    parser.add_argument("--output-dir", type=str, default="/home/yuanhanyang.yhy/project_6_outputs/sid")
     parser.add_argument("--sample-by", type=str, choices=["user", "item"], default="user")
-    parser.add_argument("--train-iterations", type=int, default=5000)
-    parser.add_argument("--train-batch-size", type=int, default=256)
-    parser.add_argument("--learning-rate", type=float, default=5e-6)
-    parser.add_argument("--hidden-dims", type=int, nargs="+", default=[512, 256, 128])
-    parser.add_argument("--embed-dim", type=int, default=32)
+    parser.add_argument("--train-iterations", type=int, default=10000)
+    parser.add_argument("--train-batch-size", type=int, default=512)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--hidden-dims", type=int, nargs="+", default=[512, 256])
+    parser.add_argument("--embed-dim", type=int, default=128)
     parser.add_argument("--codebook-size", type=int, default=32)
     parser.add_argument("--n-layers", type=int, default=3)
-    parser.add_argument("--commitment-weight", type=float, default=0.25) # 量化损失与重建损失
+    parser.add_argument("--commitment-weight", type=float, default=0.1)
     parser.add_argument("--enable-item-mi-loss", action="store_true")
     parser.add_argument("--mi-alpha", type=float, default=1.0) # 互信息损失的权重
     parser.add_argument("--mi-beta", type=float, default=1.0)

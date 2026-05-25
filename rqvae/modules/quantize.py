@@ -55,7 +55,9 @@ class Quantize(nn.Module):
         sim_vq: bool = False,  # https://arxiv.org/pdf/2411.02038
         commitment_weight: float = 0.25,
         forward_mode: QuantizeForwardMode = QuantizeForwardMode.GUMBEL_SOFTMAX,
-        distance_mode: QuantizeDistance = QuantizeDistance.L2
+        distance_mode: QuantizeDistance = QuantizeDistance.L2,
+        dead_code_threshold: int = 2,
+        dead_code_ema_decay: float = 0.99,
     ) -> None:
         super().__init__()
 
@@ -66,6 +68,11 @@ class Quantize(nn.Module):
         self.distance_mode = distance_mode
         self.do_kmeans_init = do_kmeans_init
         self.kmeans_initted = False
+        self.dead_code_threshold = dead_code_threshold
+        self.dead_code_ema_decay = dead_code_ema_decay
+
+        # EMA usage counter for dead code detection
+        self.register_buffer("code_usage_ema", torch.ones(n_embed))
 
         self.out_proj = nn.Sequential(
             nn.Linear(embed_dim, embed_dim, bias=False) if sim_vq else nn.Identity(),
@@ -96,6 +103,38 @@ class Quantize(nn.Module):
     def get_item_embeddings(self, item_ids) -> Tensor:
         return self.out_proj(self.embedding(item_ids))
 
+    @torch.no_grad()
+    def _restart_dead_codes(self, x: Tensor, ids: Tensor) -> int:
+        """Replace dead codebook entries with randomly sampled encoder outputs."""
+        usage_ema: Tensor = self.code_usage_ema  # type: ignore[assignment]
+
+        # Update EMA usage
+        one_hot = F.one_hot(ids, self.n_embed).float().sum(dim=0)
+        usage_ema.mul_(self.dead_code_ema_decay).add_(
+            one_hot, alpha=1.0 - self.dead_code_ema_decay
+        )
+
+        # Identify dead codes (usage below threshold)
+        dead_mask = usage_ema < self.dead_code_threshold
+        num_dead = int(dead_mask.sum().item())
+        if num_dead == 0 or x.shape[0] == 0:
+            return 0
+
+        # Sample replacements from current batch (add small noise for diversity)
+        replace_indices = torch.randint(0, x.shape[0], (num_dead,), device=x.device)
+        new_vectors = x[replace_indices]
+        noise = torch.randn_like(new_vectors) * 0.02
+        new_vectors = new_vectors + noise
+
+        # Replace dead code embeddings
+        dead_indices = dead_mask.nonzero(as_tuple=True)[0]
+        self.embedding.weight.data[dead_indices] = new_vectors
+
+        # Reset EMA for restarted codes
+        usage_ema[dead_indices] = self.dead_code_threshold * 2.0
+
+        return num_dead
+
     def forward(self, x, temperature) -> QuantizeOutput:
         assert x.shape[-1] == self.embed_dim
 
@@ -119,6 +158,10 @@ class Quantize(nn.Module):
             raise Exception("Unsupported Quantize distance mode.")
 
         _, ids = (dist.detach()).min(axis=1)
+
+        # Dead code restart: replace unused codes with batch samples
+        if self.training and self.dead_code_threshold > 0:
+            self._restart_dead_codes(x.detach(), ids)
 
         if self.training:
             if self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:

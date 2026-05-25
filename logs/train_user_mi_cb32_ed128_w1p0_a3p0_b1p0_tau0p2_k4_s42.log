@@ -1,0 +1,16 @@
+[env] Using device: cuda:0
+[1/3] Loading built dataset...
+[data] Item-user map loaded: items=7715 mapped_links=478319 raw_links=478319 coverage=1.0000 user_vocab=192494
+Users=192494 Items=7715 EmbDim=1024
+[2/3] Training RQ-VAE (sample-by=item)...
+Traceback (most recent call last):
+  File "/home/yuanhanyang.yhy/proj_6_rqvae/train_user.py", line 708, in <module>
+    main()
+  File "/home/yuanhanyang.yhy/proj_6_rqvae/train_user.py", line 677, in main
+    model = _train_rqvae(
+            ^^^^^^^^^^^^^
+  File "/home/yuanhanyang.yhy/proj_6_rqvae/train_user.py", line 382, in _train_rqvae
+    from modules.quantize import QuantizeForwardMode
+  File "/home/yuanhanyang.yhy/proj_6_rqvae/rqvae/modules/quantize.py", line 1, in <module>
+    import gin
+ModuleNotFoundError: No module named 'gin'
