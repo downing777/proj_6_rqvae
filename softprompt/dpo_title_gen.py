@@ -572,7 +572,7 @@ async def amain() -> int:
     ap.add_argument("--max-retries", type=int, default=5)
     ap.add_argument("--retry-base-delay", type=float, default=1.0)
     ap.add_argument("--request-timeout", type=float, default=300.0)
-    ap.add_argument("--model", type=str, default="Qwen/Qwen25-32B")
+    ap.add_argument("--model", type=str, default="qwen-plus")
     ap.add_argument(
         "--max-tokens",
         type=int,
@@ -631,11 +631,10 @@ async def amain() -> int:
 
     if args.extra_body_json.strip():
         extra_body: Optional[Dict[str, Any]] = json.loads(args.extra_body_json)
+        if not extra_body:
+            extra_body = None
     else:
-        extra_body = {
-            "top_k": 20,
-            "chat_template_kwargs": {"enable_thinking": False},
-        }
+        extra_body = None
 
     # ---- Multi-endpoint load balancing ----
     base_urls: List[str] = []

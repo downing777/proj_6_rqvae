@@ -5,27 +5,31 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-MODEL_NAME="Qwen3-30B"
-ENDPOINTS="http://localhost:8001/v1,http://localhost:8002/v1,http://localhost:8003/v1,http://localhost:8004/v1,http://localhost:8005/v1,http://localhost:8006/v1,http://localhost:8007/v1,http://localhost:8008/v1"
+MODEL_NAME="qwen-plus"
+API_URL="https://idealab.alibaba-inc.com/api/openai/v1/"
+API_KEY="7015f1753e78f3067053c6432a933cb7"
+
+USER_SID="/home/yuanhanyang.yhy/model_hub/amazon_user/user_semantic_ids.jsonl"
 
 OUTPUT_DIR="/home/yuanhanyang.yhy/project_6_outputs/data"
 LOG_DIR="${SCRIPT_DIR}/logs"
 mkdir -p "${OUTPUT_DIR}" "${LOG_DIR}"
 
-OUTPUT_JSONL="${OUTPUT_DIR}/dpo_electronics_generated_${MODEL_NAME}_xlength.jsonl"
+OUTPUT_JSONL="${OUTPUT_DIR}/dpo_electronics_generated_${MODEL_NAME}.jsonl"
 LOG="${LOG_DIR}/dpo_title_gen_${MODEL_NAME}.log"
 PIDFILE="${LOG_DIR}/dpo_title_gen_${MODEL_NAME}.pid"
 
 nohup python3 dpo_title_gen.py \
-  --user-sid /home/yuanhanyang.yhy/model_hub/amazon_user/user_semantic_ids.jsonl \
+  --user-sid "${USER_SID}" \
   --item-jsonl /home/yuanhanyang.yhy/model_hub/amazon_user/raw/step4/final_filtered_item_meta_electronics.jsonl \
   --reviews-jsonl /home/yuanhanyang.yhy/model_hub/amazon_user/raw/step4/final_target_user_reviews_by_category/final_target_user_reviews_electronics.jsonl \
   --output-jsonl "${OUTPUT_JSONL}" \
-  --openai-base-urls "${ENDPOINTS}" \
-  --openai-api-key "EMPTY" \
+  --openai-base-url "${API_URL}" \
+  --openai-api-key "${API_KEY}" \
   --model "${MODEL_NAME}" \
   --max-tokens 2048 \
-  --max-concurrency 32 \
+  --max-concurrency 8 \
+  --extra-body-json '{}' \
   >> "${LOG}" 2>&1 &
 
 echo $! | tee "${PIDFILE}"
