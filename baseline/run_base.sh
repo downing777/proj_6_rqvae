@@ -30,9 +30,9 @@ cd "${ROOT}"
 eval "$(conda shell.bash hook)"
 conda activate softprompt
 
-QWEN_BASE="${QWEN_BASE:-/home/yuanhanyang.yhy/model_hub/Qwen3.5-9B}"
+# QWEN_BASE="${QWEN_BASE:-/home/yuanhanyang.yhy/model_hub/Qwen3.5-9B}"
 OUT_DIR="${OUT_DIR:-/home/yuanhanyang.yhy/project_6_outputs}"
-VERSION="${VERSION:-sft_dpo_farsid_11}"
+VERSION="${VERSION:-qwen3-30B-farsid-11-sidrebuild-0527}"
 BASELINE_MODEL="${BASELINE_MODEL:-Qwen3.5-9B}"
 
 # ---- Auto-nohup: 直接 bash run_baseline.sh 即可后台运行 ----
@@ -71,15 +71,15 @@ EVAL_SAMPLES="${EVAL_SAMPLES:-500}"
 SEED="${SEED:-42}"
 
 # Judge (vLLM)
-JUDGE_BASE_URL="${JUDGE_BASE_URL:-http://localhost:8003/v1}"
+JUDGE_BASE_URL="${JUDGE_BASE_URL:-http://localhost:8005/v1}"
 JUDGE_API_KEY="${JUDGE_API_KEY:-EMPTY}"
-JUDGE_MODEL="${JUDGE_MODEL:-Qwen3.5-27B}"
+JUDGE_MODEL="${JUDGE_MODEL:-Qwen3-30B}"
 JUDGE_CONC="${JUDGE_CONC:-8}"
 
 # Baseline 生成器 (可独立指定端点和模型, 默认复用 judge)
 # BASELINE_BASE_URL="${BASELINE_BASE_URL:-https://idealab.alibaba-inc.com/api/openai/v1/}"
 # BASELINE_API_KEY="${BASELINE_API_KEY:-7015f1753e78f3067053c6432a933cb7}"
-BASELINE_BASE_URL="${BASELINE_BASE_URL:-http://localhost:8001/v1}"
+BASELINE_BASE_URL="${BASELINE_BASE_URL:-http://localhost:8004/v1}"
 BASELINE_API_KEY="${BASELINE_API_KEY:-EMPTY}"
 BASELINE_CONC="${BASELINE_CONC:-8}"
 TARGET_WORDS="${TARGET_WORDS:-12}"
@@ -92,7 +92,7 @@ BASELINE_TAG="${BASELINE_TAG:-$(_default_tag "${BASELINE_MODEL}")}"
 
 # 用户画像证据源 (跟 run_eval.sh 同源)
 REVIEWS_JSONL="${REVIEWS_JSONL:-/home/yuanhanyang.yhy/model_hub/amazon_user/raw/step4/final_target_user_reviews_by_category/final_target_user_reviews_electronics.jsonl}"
-USER_SID_JSONL="${USER_SID_JSONL:-/home/yuanhanyang.yhy/model_hub/amazon_user/user_semantic_ids.jsonl}"
+USER_SID_JSONL="${USER_SID_JSONL:-/home/yuanhanyang.yhy/project_6_outputs/sid/exp_mi_cb32_ed128_w0p1_a1p4_b1p5_tau0p5_k32_s42/user_semantic_ids.jsonl}"
 
 # 输出路径
 PRED_BASELINE="${BASELINE_DIR}/predictions_${BASELINE_TAG}_${VERSION}.jsonl"

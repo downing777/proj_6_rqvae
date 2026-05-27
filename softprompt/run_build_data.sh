@@ -30,15 +30,15 @@ eval "$(conda shell.bash hook)"
 conda activate softprompt
 
 # ---- 版本和路径 ----
-VERSION="${VERSION:-qwen3-30B-farsid_11}"
+VERSION="${VERSION:-qwen3-30B-farsid-11-sidrebuild-0527}"
 OUT_DIR="${OUT_DIR:-/home/yuanhanyang.yhy/project_6_outputs}"
 
 # dpo_title_gen.py 的输出 (Phase 1 产出, 每行 {item_id, sid, title_chosen, context, user_id})
-TITLE_GEN_JSONL="${TITLE_GEN_JSONL:-${OUT_DIR}/data/dpo_electronics_generated_Qwen3-30B_xlength.jsonl}"
+TITLE_GEN_JSONL="${TITLE_GEN_JSONL:-${OUT_DIR}/data/dpo/dpo_electronics_generated_Qwen3-30B.jsonl}"
 
 # User embedding 和 SID 映射
 USER_NPZ="${USER_NPZ:-/home/yuanhanyang.yhy/model_hub/amazon_user/amazon_user_item_dataset.user.npz}"
-USER_SID_JSONL="${USER_SID_JSONL:-/home/yuanhanyang.yhy/model_hub/amazon_user/user_semantic_ids.jsonl}"
+USER_SID_JSONL="${USER_SID_JSONL:-/home/yuanhanyang.yhy/project_6_outputs/sid/exp_mi_cb32_ed128_w0p1_a1p4_b1p5_tau0p5_k32_s42/user_semantic_ids.jsonl}"
 
 # 商品元数据 (build_sft_from_dpo 的可选参数)
 ITEM_JSONL="${ITEM_JSONL:-/home/yuanhanyang.yhy/model_hub/amazon_user/raw/step4/final_filtered_item_meta_electronics.jsonl}"
@@ -50,7 +50,7 @@ SEED="${SEED:-42}"
 
 # 输出路径
 DPO_JSONL="${OUT_DIR}/data/dpo_far_sid_1to1_${VERSION}.jsonl"
-SPLIT_DIR="${OUT_DIR}/split_${VERSION}"
+SPLIT_DIR="${OUT_DIR}/split/split_${VERSION}"
 SFT_JSONL="${OUT_DIR}/sft_from_chosen_title_${VERSION}.jsonl"
 
 export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"

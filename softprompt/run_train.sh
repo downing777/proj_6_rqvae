@@ -18,8 +18,8 @@ eval "$(conda shell.bash hook)"
 conda activate softprompt
 
 # ---- 版本标识: 用于区分不同实验, 会作为后缀附加到 log/weight 文件名上 ----
-VERSION="${VERSION:-instruct30b_farsid_11}"
-QWEN_BASE="${QWEN_BASE:-/home/yuanhanyang.yhy/model_hub/Qwen3-30B-A3B-Instruct-2507-FP8}"
+VERSION="${VERSION:-qwen3-30B-farsid-11-sidrebuild-0527}"
+QWEN_BASE="${QWEN_BASE:-/home/yuanhanyang.yhy/model_hub/Qwen3.5-9B}"
 
 # ---- Auto-nohup: 如果不是被 nohup 调用的，则自动用 nohup 重启自己 ----
 if [[ -z "${_TRAIN_NOHUP_WRAPPER:-}" ]]; then
@@ -48,11 +48,11 @@ if [[ -z "${_TRAIN_NOHUP_WRAPPER:-}" ]]; then
   exit 0
 fi
 
-DPO_JSONL="${DPO_JSONL:-/home/yuanhanyang.yhy/project_6_outputs/data/dpo_electronics_generated_Qwen3.5-27B.jsonl}"
+DPO_JSONL="${DPO_JSONL:-/home/yuanhanyang.yhy/project_6_outputs/data/dpo/dpo_far_sid_1to1_${VERSION}.jsonl}"
 ITEM_JSONL="${ITEM_JSONL:-/home/yuanhanyang.yhy/model_hub/amazon_user/raw/step4/final_filtered_item_meta_electronics.jsonl}"
 OUT_DIR="${OUT_DIR:-/home/yuanhanyang.yhy/project_6_outputs}"
-SPLIT_DIR="${OUT_DIR}/split"
-SFT_JSONL="${OUT_DIR}/sft_from_chosen_title.jsonl"
+SPLIT_DIR="${OUT_DIR}/split/${VERSION}"
+SFT_JSONL="${OUT_DIR}/data/sft/sft_from_chosen_title_${VERSION}.jsonl"
 SFT_DIR="${OUT_DIR}/weights/${VERSION}/sft"
 DPO_DIR="${OUT_DIR}/weights/${VERSION}/dpo"
 

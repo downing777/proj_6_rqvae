@@ -433,7 +433,6 @@ async def call_model_once(
         ],
         "max_tokens": max_tokens,
         "temperature": temperature,
-        "top_p": top_p,
         "timeout": request_timeout,
     }
     if extra_body:

@@ -25,7 +25,7 @@ QWEN_BASE="${QWEN_BASE:-/home/yuanhanyang.yhy/model_hub/Qwen3.5-9B}"
 OUT_DIR="${OUT_DIR:-/home/yuanhanyang.yhy/project_6_outputs}"
 
 # ---- 版本标识: 必须与 run_train.sh 中的 VERSION 一致, 用于定位权重和区分 eval 输出 ----
-VERSION="${VERSION:-sft_dpo_farsid_11}"
+VERSION="${VERSION:-qwen3-30B-farsid-11-sidrebuild-0527}"
 
 # ---- Auto-nohup: 直接 bash run_eval.sh 即可后台运行 ----
 if [[ -z "${_EVAL_NOHUP_WRAPPER:-}" ]]; then
@@ -33,7 +33,7 @@ if [[ -z "${_EVAL_NOHUP_WRAPPER:-}" ]]; then
   _BASE_MODEL_NAME="$(basename "${QWEN_BASE}")"
   _LOG_DIR="${OUT_DIR}/logs/${_BASE_MODEL_NAME}"
   mkdir -p "${_LOG_DIR}"
-  _FULL_LOG="${_LOG_DIR}/eval_full_${_BASE_MODEL_NAME}_${VERSION}.log"
+  _FULL_LOG="${_LOG_DIR}/eval_full_${_BASE_MODEL_NAME}_${VERSION}_rt1.log"
   _PIDFILE="${_LOG_DIR}/eval_${_BASE_MODEL_NAME}_${VERSION}.pid"
 
   nohup bash "$0" "$@" >> "${_FULL_LOG}" 2>&1 &
@@ -74,13 +74,13 @@ EVAL_SAMPLES="${EVAL_SAMPLES:-500}"
 SEED="${SEED:-42}"
 
 # LLM judge settings
-JUDGE_BASE_URL="${JUDGE_BASE_URL:-http://localhost:8003/v1}"
+JUDGE_BASE_URL="${JUDGE_BASE_URL:-http://localhost:8004/v1}"
 JUDGE_API_KEY="${JUDGE_API_KEY:-EMPTY}"
-JUDGE_MODEL="${JUDGE_MODEL:-Qwen3.5-27B}"
+JUDGE_MODEL="${JUDGE_MODEL:-Qwen3-30B}"
 
 # User-group evidence sources (real Amazon reviews + user->SID mapping)
 REVIEWS_JSONL="${REVIEWS_JSONL:-/home/yuanhanyang.yhy/model_hub/amazon_user/raw/step4/final_target_user_reviews_by_category/final_target_user_reviews_electronics.jsonl}"
-USER_SID_JSONL="${USER_SID_JSONL:-/home/yuanhanyang.yhy/model_hub/amazon_user/user_semantic_ids.jsonl}"
+USER_SID_JSONL="${USER_SID_JSONL:-/home/yuanhanyang.yhy/project_6_outputs/sid/exp_mi_cb32_ed128_w0p1_a1p4_b1p5_tau0p5_k32_s42/user_semantic_ids.jsonl}"
 
 export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES="${INFER_GPU}"
@@ -153,29 +153,29 @@ echo ""
 # ======================================================================
 # Step 2: LLM-as-judge evaluation (SFT)
 # ======================================================================
-# echo "---- [2/4] LLM-as-Judge (SFT vs Original title) ----"
-# if [[ ! -f "${PRED_SFT}" ]]; then
-#   echo "  SKIPPED: SFT predictions not available."
-#   EVAL_SFT="(not generated)"
-# else
-#   EVAL_SFT="${EVAL_DIR}/eval_results_sft_${VERSION}.jsonl"
-#   SUMMARY_SFT="${EVAL_DIR}/eval_summary_sft_${VERSION}.json"
-#   echo "  Running LLM judge on SFT predictions..."
-#   echo "  Judge model: ${JUDGE_MODEL} @ ${JUDGE_BASE_URL}"
-#   python3 softprompt/eval/offline_eval.py \
-#     --pred-jsonl "${PRED_SFT}" \
-#     --reviews-jsonl "${REVIEWS_JSONL}" \
-#     --user-sid "${USER_SID_JSONL}" \
-#     --output-jsonl "${EVAL_SFT}" \
-#     --summary-json "${SUMMARY_SFT}" \
-#     --openai-base-url "${JUDGE_BASE_URL}" \
-#     --openai-api-key "${JUDGE_API_KEY}" \
-#     --model "${JUDGE_MODEL}" \
-#     --max-concurrency 8 \
-#     --extra-body-json '{"top_k": 1, "chat_template_kwargs": {"enable_thinking": false}}' \
-#   echo "  Done!"
-# fi
-# echo ""
+echo "---- [2/4] LLM-as-Judge (SFT vs Original title) ----"
+if [[ ! -f "${PRED_SFT}" ]]; then
+  echo "  SKIPPED: SFT predictions not available."
+  EVAL_SFT="(not generated)"
+else
+  EVAL_SFT="${EVAL_DIR}/eval_results_sft_${VERSION}_rt1.jsonl"
+  SUMMARY_SFT="${EVAL_DIR}/eval_summary_sft_${VERSION}_rt1.json"
+  echo "  Running LLM judge on SFT predictions..."
+  echo "  Judge model: ${JUDGE_MODEL} @ ${JUDGE_BASE_URL}"
+  python3 softprompt/eval/offline_eval.py \
+    --pred-jsonl "${PRED_SFT}" \
+    --reviews-jsonl "${REVIEWS_JSONL}" \
+    --user-sid "${USER_SID_JSONL}" \
+    --output-jsonl "${EVAL_SFT}" \
+    --summary-json "${SUMMARY_SFT}" \
+    --openai-base-url "${JUDGE_BASE_URL}" \
+    --openai-api-key "${JUDGE_API_KEY}" \
+    --model "${JUDGE_MODEL}" \
+    --max-concurrency 8 \
+    --extra-body-json '{"top_k": 1, "chat_template_kwargs": {"enable_thinking": false}}'
+  echo "  Done!"
+fi
+echo ""
 
 # ======================================================================
 # Step 3: DPO Prediction (generate if not exist)
@@ -210,8 +210,8 @@ if [[ ! -f "${PRED_DPO}" ]]; then
   echo "  SKIPPED: DPO predictions not available."
   EVAL_DPO="(not generated)"
 else
-  EVAL_DPO="${EVAL_DIR}/eval_results_dpo_${VERSION}_xlength.jsonl"
-  SUMMARY_DPO="${EVAL_DIR}/eval_summary_dpo_${VERSION}_xlength.json"
+  EVAL_DPO="${EVAL_DIR}/eval_results_dpo_${VERSION}_rt1.jsonl"
+  SUMMARY_DPO="${EVAL_DIR}/eval_summary_dpo_${VERSION}_rt1.json"
   echo "  Running LLM judge on DPO predictions..."
   echo "  Judge model: ${JUDGE_MODEL} @ ${JUDGE_BASE_URL}"
   python3 softprompt/eval/offline_eval.py \
@@ -224,8 +224,7 @@ else
     --openai-api-key "${JUDGE_API_KEY}" \
     --model "${JUDGE_MODEL}" \
     --max-concurrency 8 \
-    --extra-body-json '{"top_k": 1, "chat_template_kwargs": {"enable_thinking": false}}' \
-    || echo "  [WARN] DPO judge finished with partial errors (non-zero exit code)"
+    --extra-body-json '{"top_k": 1, "chat_template_kwargs": {"enable_thinking": false}}' 
   echo "  Done!"
 fi
 
