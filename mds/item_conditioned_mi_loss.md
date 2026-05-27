@@ -175,6 +175,7 @@ $$
 - `--mi-tau`：软分配温度，默认 `0.2`
 - `--mi-topk`：top-k 近邻码字，默认 `32`（<=0 或 >= codebook_size 时等价全量）
 - `--mi-reg-layers`：参与正则的层数，默认 `3`
+- `--mi-warmup-epochs`：前多少个 epoch 不启用 MI loss，默认 `0`
 - `--no-dedup-users-in-item-batch`：关闭 item batch 去重（默认是去重开启）
 
 ---
@@ -218,6 +219,14 @@ $$
    - 减小 `mi_weight`
    - 先固定 `mi_topk` 在中等值（如 32）
    - 观察 base loss 是否被正则压制
+
+### 7.4 Warmup 建议
+
+如果 MI loss 一开始就让 SID 波动很大，可以先让 RQ-VAE 单独收敛一段时间，再打开 MI 正则：
+
+- 先把 `--mi-warmup-epochs` 设成 `3~10`
+- warmup 结束后再启用完整的 `mi_alpha / mi_beta / mi_weight`
+- 如果仍然不稳，优先拉长 warmup，再把 `mi_weight` 调小
 
 ---
 

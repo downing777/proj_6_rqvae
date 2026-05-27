@@ -25,6 +25,7 @@ MI_BETA=1.3
 MI_TAU=0.5
 MI_TOPK=32
 MI_REG_LAYERS=3
+MI_WARMUP_STEPS=1000
 
 # ====== 输出路径 ======
 OUTPUT_ROOT="/home/yuanhanyang.yhy/project_6_outputs/sid"
@@ -152,6 +153,7 @@ python -u train_user.py \
   --mi-tau "${MI_TAU}" \
   --mi-topk "${MI_TOPK}" \
   --mi-reg-layers "${MI_REG_LAYERS}" \
+  --mi-warmup-steps "${MI_WARMUP_STEPS}" \
   --output-dir "${OUT_DIR}"
 
 echo ""

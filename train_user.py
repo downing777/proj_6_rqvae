@@ -378,6 +378,7 @@ def _train_rqvae(
     mi_tau: float,
     mi_topk: int,
     mi_reg_layers: int,
+    mi_warmup_steps: int,
 ):
     from modules.quantize import QuantizeForwardMode
     from modules.rqvae import RqVae
@@ -430,6 +431,7 @@ def _train_rqvae(
                 "mi_tau": mi_tau,
                 "mi_topk": mi_topk,
                 "mi_reg_layers": mi_reg_layers,
+                "mi_warmup_steps": mi_warmup_steps,
             },
         )
 
@@ -464,6 +466,8 @@ def _train_rqvae(
         if item_groups is not None:
             item_groups = [group.to(device) for group in item_groups]
 
+        use_mi_now = use_item_mi_loss and step > mi_warmup_steps
+
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
@@ -488,7 +492,7 @@ def _train_rqvae(
             "mi_h_global": x.new_zeros(()),
             "mi_h_cond": x.new_zeros(()),
         }
-        if use_item_mi_loss and item_groups is not None:
+        if use_mi_now and item_groups is not None:
             mi_reg, mi_metrics = _compute_item_mi_regularizer(
                 model=model,
                 residuals=quantized.residuals,
@@ -521,7 +525,9 @@ def _train_rqvae(
                 f"t={gumbel_t:.3f} cb=[{cb_str}]"
             )
             if use_item_mi_loss:
+                warmup_state = "on" if use_mi_now else f"warmup(step {step}/{mi_warmup_steps})"
                 msg += (
+                    f" mi_state={warmup_state}"
                     f" mi={mi_reg.item():.4f}"
                     f" h_global={mi_metrics['mi_h_global'].item():.4f}"
                     f" h_cond={mi_metrics['mi_h_cond'].item():.4f}"
@@ -647,6 +653,7 @@ def main() -> None:
     parser.add_argument("--mi-tau", type=float, default=0.2)
     parser.add_argument("--mi-topk", type=int, default=32)
     parser.add_argument("--mi-reg-layers", type=int, default=3)
+    parser.add_argument("--mi-warmup-steps", type=int, default=0)
     parser.add_argument("--no-dedup-users-in-item-batch", action="store_false", dest="dedup_users_in_item_batch")
     parser.set_defaults(dedup_users_in_item_batch=True)
     parser.add_argument(
@@ -697,6 +704,7 @@ def main() -> None:
         mi_tau=args.mi_tau,
         mi_topk=args.mi_topk,
         mi_reg_layers=args.mi_reg_layers,
+        mi_warmup_steps=args.mi_warmup_steps,
     )
 
     print("[3/3] Exporting semantic IDs...")
